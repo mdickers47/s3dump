@@ -1,4 +1,4 @@
-#!/usr/local/bin/python
+#!/usr/bin/python
 #
 # s3dump.py - Similar to a tape driver, in that you pour bits in or
 # pour them out.  Meant to be used with dump/restore, but doesn't care
@@ -22,12 +22,12 @@
 
 import Queue
 import base64
+import hashlib
 import hmac
 import httplib
 import getopt
 import os
 import re
-import sha
 import socket
 import sys
 import threading
@@ -103,20 +103,24 @@ def canonical_string(method, path, headers, expires=None):
 
   return buf
 
+
 # computes the base64'ed hmac-sha hash of the canonical string and the secret
 # access key, optionally urlencoding the result
 def encode(aws_secret_access_key, str, urlencode=False):
-  b64_hmac = base64.encodestring(hmac.new(aws_secret_access_key, str, sha).digest()).strip()
+  b64_hmac = base64.encodestring(hmac.new(aws_secret_access_key, str,
+                                          hashlib.sha1).digest()).strip()
   if urlencode:
     return urllib.quote_plus(b64_hmac)
   else:
     return b64_hmac
+
 
 def merge_meta(headers, metadata):
   final_headers = headers.copy()
   for k in metadata.keys():
     final_headers[METADATA_PREFIX + k] = metadata[k]
   return final_headers
+
 
 class AWSAuthConnection:
     
@@ -353,14 +357,18 @@ class ListBucketHandler(xml.sax.ContentHandler):
 
 class ChunkUploader(threading.Thread):
   
-  def __init__(self, queue, ringbuf, key_prefix):
+  def __init__(self, queue, ringbuf, key_prefix, ratelimit):
     threading.Thread.__init__(self)
     self.queue = queue
     self.ringbuf = ringbuf
     self.key_prefix = key_prefix
 
+    self.ratelimit = ratelimit
+    self.conn = None
+    self.writes = []
+
   def run(self):
-    conn = AWSAuthConnection(is_secure=True)
+    self.conn = AWSAuthConnection(is_secure=True)
     chunk = 0
     read_ptr = 0
     while True:
@@ -375,26 +383,37 @@ class ChunkUploader(threading.Thread):
         i = (i + 1) % len(self.ringbuf)
       key = '%s:%s' % (self.key_prefix, chunk)
 
-      tries = 10
+      tries = 20
       while tries:
         try:
           print 'uploader: key is %s (%ld bytes)' % (key, bytes)
-          conn.open_stream(BUCKET_NAME, key, bytes)
+          self.conn.open_stream(BUCKET_NAME, key, bytes)
           read_ptr = start_ptr
           while read_ptr != stop_ptr:
-            conn.send_stream(self.ringbuf[read_ptr])
+            self.send_with_ratelimit(self.ringbuf[read_ptr])
             read_ptr = (read_ptr + 1) % len(self.ringbuf)
-          response = conn.close_stream()
+          response = self.conn.close_stream()
           response.read() # have to read() before starting a new request
           if response.status >= 300:
             raise Exception, 'Amazon returned error %d: %s' % \
                   (response.status, response.reason)
           break
         except Exception, e:
-          sys.stderr.write('uploading chunk %d failed: %s\n' % (chunk, e))
+          try:
+            self.conn.close_stream().read()
+          except:
+            pass
+          self.conn = None
           tries -= 1
+          to_sleep = min(600, 2 ** (20 - tries))
+          sys.stderr.write('uploading chunk %d failed: %s\n' % (chunk, e))
+          sys.stderr.write('trying again in %ds (%d remaining).\n' % \
+                             (to_sleep, tries))
+          time.sleep(to_sleep)
+          self.conn = AWSAuthConnection(is_secure=True)
       else:
-        sys.exit(1)
+        # kill this thread
+        return
 
       # Release the memory only after the chunk is successfully posted.
       read_ptr = start_ptr
@@ -406,17 +425,46 @@ class ChunkUploader(threading.Thread):
     print 'uploader: done'
     return
 
+  def send_with_ratelimit(self, data):
+    now = time.time()
+    i = 0
+    sent_last_sec = self.ratelimit
+    to_send = len(data)
+
+    while self.ratelimit and sent_last_sec + to_send > self.ratelimit:
+      sent_last_sec = 0
+      for (bytes, when) in self.writes:
+        if now - when < 1:
+          sent_last_sec += bytes
+          if sent_last_sec + to_send > self.ratelimit:
+            # sleep long enough for the budget breaker to rotate out
+            to_sleep = 1 - (now - when)
+            time.sleep(to_sleep)
+            now = time.time()
+            break
+        else:
+          # looking more than 1s ago
+          break
+
+    self.conn.send_stream(data)
+
+    self.writes.insert(0, (len(data), now))
+    while now - self.writes[-1][1] > 1:
+      self.writes = self.writes[:-1]
+
 
 def _SortByChunkNumber(a, b):
   ca = int(a.split(':')[-1])
   cb = int(b.split(':')[-1])
   return cmp(ca, cb)
 
+
 def ListChunks(conn, prefix):
   keys = [ x.key for x in conn.list_bucket(BUCKET_NAME).entries ]
   keys = filter(lambda x: x.startswith(prefix), keys)
   keys.sort(_SortByChunkNumber)
   return keys
+
 
 def DeleteChunkedFile(conn, prefix):
   #print 'delete %s' % prefix
@@ -427,6 +475,7 @@ def DeleteChunkedFile(conn, prefix):
     if res.status >= 300:
       print 'deleting %s, Amazon returned error %d: %s' % \
             (k, res.status, res.reason)
+
 
 def RetrieveDumpTree(conn):
   # The map of stored dumps is complicated:
@@ -453,6 +502,7 @@ def RetrieveDumpTree(conn):
 
   return dumps
 
+
 def PrintDumpTree(t):
   filesystems = t.keys()
   filesystems.sort()
@@ -469,12 +519,23 @@ def PrintDumpTree(t):
         total += t[f][l][d]
   return total
 
+
 def HumanizeBytes(b):
   "Convert 2220934 to 2.2M, etc."
   units = ((40, 'T'), (30, 'G'), (20, 'M'), (10, 'k'))
   for u in units:
     if b > 2 ** u[0]: return '%.1f%s' % (float(b) / 2 ** u[0], u[1])
   return str(b)
+
+
+def DehumanizeBytes(s):
+  units = ((40, 'T'), (30, 'G'), (20, 'M'), (10, 'K')) # NB K not k
+  for bits, u in units:
+    if s.upper().endswith(u):
+      return long(s[:-1]) * (2 ** bits)
+  else:
+    return long(s)
+
 
 def usage():
   print 'Usage: s3dump.py (-d|-r|-l|-i|-c n) [-h hostname] [-w YYYY-MM-DD] [-a] fs level\n' \
@@ -490,13 +551,17 @@ def usage():
         '  -a: list or delete dumps for all hosts, not just me\n' \
         '  -h: override default hostname (%s)\n' \
         '  -w: override default date stamp, use format YYYY-MM-DD\n' \
+        '  -L: ratelimit outgoing dump to n bytes/sec.  optional suffixes k, m, g.\n' \
         '  fs: name of filesystem you are dumping, or an arbitrary string\n' \
-        '  level: what level dump (0-9), or an arbitrary int' % HOSTNAME
+        '  level: an arbitrary int, possibly the dump level (0-9)' % HOSTNAME
   return 1
 
+
 if __name__ == '__main__':
+
+  # parse command line
   try:
-    opts, remainder = getopt.getopt(sys.argv[1:], 'drilac:h:w:')
+    opts, remainder = getopt.getopt(sys.argv[1:], 'drilac:h:w:L:')
     opts = dict(opts)
     if '-d' in opts or '-r' in opts:
       filesystem, level = remainder
@@ -506,10 +571,19 @@ if __name__ == '__main__':
       host = opts['-h']
     else:
       host = HOSTNAME
+    if '-L' in opts and not '-d' in opts:
+      raise ValueError('-L only works with -d')
+    elif '-L' in opts:
+      ratelimit = DehumanizeBytes(opts['-L'])
+    else:
+      ratelimit = 0
     if ('-d' in opts) + ('-r' in opts) + ('-l' in opts) + ('-i' in opts) \
            + ('-c' in opts) != 1:
-      raise ValueError
-  except (getopt.GetoptError, ValueError, IndexError):
+      raise ValueError('must select exactly one of -d, -r, -l, -i')
+    if ':' in host or ':' in filesystem or ':' in opts.get('-w', ''):
+      raise ValueError('host, filesystem, date cannot contain :')
+  except (getopt.GetoptError, ValueError, IndexError), e:
+    sys.stderr.write('command line error: %s\n\n' % e)
     sys.exit(usage())
 
   if '-i' in opts:
@@ -533,20 +607,21 @@ if __name__ == '__main__':
     chunk_queue = Queue.Queue()
     date = opts.get('-w', time.strftime(DATE_FMT))
     key_prefix = '%s:%s:%s:%s' % (host, filesystem, level, date)
-    uploader = ChunkUploader(chunk_queue, block_buf, key_prefix)
+    uploader = ChunkUploader(chunk_queue, block_buf, key_prefix, ratelimit)
     uploader.setDaemon(True)
     uploader.start()
     
     while True:
+      if not uploader.is_alive():
+        sys.exit(1)
       while block_buf[write_ptr] is not None:
         #print 'main: waiting for buffer slot %d to clear' % write_ptr
-        time.sleep(2)
+        time.sleep(0.1)
       data = sys.stdin.read(BLOCK_SIZE)
       block_buf[write_ptr] = data
       buffered_bytes += BLOCK_SIZE
       write_ptr = (write_ptr + 1) % len(block_buf)
-      if (buffered_bytes >= S3_CHUNK_SIZE
-          or len(data) < BLOCK_SIZE):
+      if (buffered_bytes >= S3_CHUNK_SIZE or len(data) < BLOCK_SIZE):
         print 'main: queueing chunk for upload'
         chunk_queue.put(write_ptr)
         buffered_bytes = 0
