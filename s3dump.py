@@ -4,7 +4,7 @@
 # pour them out.  Meant to be used with dump/restore, but doesn't care
 # what your bits are.
 #
-# Copyright 2006-08 Michael Dickerson (mikey@singingtree.com).
+# Copyright 2006-12 Michael Dickerson (mikey@singingtree.com).
 # Use permitted under the same terms as the license provided with the
 # Amazon code, below.
 #
@@ -141,12 +141,29 @@ class AWSAuthConnection:
     return self.make_request('PUT', bucket, headers)
 
   def list_bucket(self, bucket, options={}, headers={}):
-    path = bucket
-    if options:
+    self.entries = []
+    while True:
+      path = bucket
+      if options:
         path += '?'
         path += '&'.join(["%s=%s" % (param, urllib.quote_plus(str(options[param]))) for param in options])
 
-    return ListBucketResponse(self.make_request('GET', path, headers))
+      lst = ListBucketResponse(self.make_request('GET', path, headers))
+
+      for e in lst.entries:
+        self.entries.append(e)
+
+      if not lst.is_truncated:
+        break
+
+      # re-request with the marker set at the last one we got
+      # this time round. This sort of conflicts with the NextMarker
+      # code posted all over the web - but seems to work an dovetails
+      # nicely with http://docs.amazonwebservices.com/AmazonS3/latest/API/RESTBucketGET.html
+      #
+      options.update({'marker': self.entries[-1].key})
+
+    return self
 
   def delete_bucket(self, bucket, headers={}):
     return self.make_request('DELETE', bucket, headers)
@@ -341,7 +358,9 @@ class ListBucketHandler(xml.sax.ContentHandler):
     elif name == 'Marker':
       self.marker = self.curr_text
     elif name == 'IsTruncated':
-      self.is_truncated = self.curr_text == 'true'
+      # lore on the web suggests 'True;' - but this has not
+      # been observed at the 6 AWS endpoints 2012-01-05
+      self.is_truncated = self.curr_text.lower() == 'true'
     elif name == 'Delimiter':
       self.delimiter = self.curr_text
     elif name == 'MaxKeys':
@@ -565,12 +584,16 @@ if __name__ == '__main__':
     opts = dict(opts)
     if '-d' in opts or '-r' in opts:
       filesystem, level = remainder
+      if ':' in filesystem or ':' in level:
+        raise ValueError('filesystem, level cannot contain :')
       _ = int(level) # force a ValueError if not an int
     if '-c' in opts: opts['-c'] = int(opts['-c'])
     if '-h' in opts:
       host = opts['-h']
     else:
       host = HOSTNAME
+    if ':' in host:
+      raise ValueError('host cannot contain :')
     if '-L' in opts and not '-d' in opts:
       raise ValueError('-L only works with -d')
     elif '-L' in opts:
@@ -580,8 +603,6 @@ if __name__ == '__main__':
     if ('-d' in opts) + ('-r' in opts) + ('-l' in opts) + ('-i' in opts) \
            + ('-c' in opts) != 1:
       raise ValueError('must select exactly one of -d, -r, -l, -i')
-    if ':' in host or ':' in filesystem or ':' in opts.get('-w', ''):
-      raise ValueError('host, filesystem, date cannot contain :')
   except (getopt.GetoptError, ValueError, IndexError), e:
     sys.stderr.write('command line error: %s\n\n' % e)
     sys.exit(usage())
@@ -664,7 +685,7 @@ if __name__ == '__main__':
         total += PrintDumpTree(dumps[h])
     print
     print 'Total data stored: %s ($%.2f/month)' % \
-      (HumanizeBytes(total), total / (2**30) * 0.15)
+      (HumanizeBytes(total), total / (2**30) * 0.14)
 
   elif '-r' in opts:
     conn = AWSAuthConnection(is_secure=False)
