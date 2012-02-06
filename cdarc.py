@@ -1,7 +1,15 @@
 #!/usr/bin/python
 """cdarc - Maintain an offline catalog of optical discs that mirror files on disk.
 
-Usage: cdarc [-r which] [-v] (scan | burn | init path label)
+Usage: cdarc [-r which] [-v] (scan | burn | status | init path label)
+
+-r: which root to operate on, can be specified by path or label
+-v: more verbosity
+
+scan: compare database records against disk, and update database
+burn: burn an optical disc with as many files as will fit, oldest first
+status: print some statistics
+init: create records for a new tree root (not implemented)
 
 Copyright 2012 Michael Dickerson <mikey@singingtree.com>
 """
@@ -79,6 +87,7 @@ def burn_disc(conn, rootid, capacity, label):
   img_size = 0
   img_file_ids = []
   cur = dcursor(conn)
+  capacity = int(0.99 * capacity) # must allow a little filesystem overhead
 
   print 'Generating %s volume named %s' % (humanize_bytes(capacity), label)
   print 'Temporary packing list at %s' % path_list
@@ -237,81 +246,108 @@ def scan_tree(conn, root, verbose=False):
     root - (id, path_root, label) tuple
     verbose - print the name of each file and its status
   Returns:
-    (total size of new files, total size of files with no backups)
+    None
   """
 
   cur = dcursor(conn)
-  new_bytes = 0
-  nobackup_bytes = 0
-  files_seen = {}
   rootid, root_path = root[:2]
+  files_in_db = {}
+  files_on_disk = {}
+  files_identical = files_changed = files_added = files_deleted = 0
+
+  # NB that at ~100 bytes of metadata per file path, 100k files fit in 10MB.
+  # So it is probably ok (and much faster) to do all the reconciliation in RAM
+  # and then run the minimal set of database updates.
+
+  ID, PATH, MTIME, SIZE, DISCVOL = range(5)
 
   for parent, dirs, files in os.walk(root_path):
     for f in files:
       path = os.path.join(parent, f)
       st = os.stat(path)
       # don't want to deal with float st_mtime that we sometimes get
-      st_mtime = int(st.st_mtime)
-      st_size = st.st_size
+      digest = hashlib.md5(path).digest()
+      files_on_disk[digest] = (None, path, int(st.st_mtime), st.st_size, None)
 
-      cur.execute('SELECT id, st_mtime, st_size, disc_vol FROM file WHERE '
-                  'file=%s AND root=%d;' % (dbquote(path), rootid))
-      row = cur.fetchone()
-      if row:
-        if row['st_mtime'] == st_mtime and row['st_size'] == st_size:
-          # file is already known and unmodified..
-          if row['disc_vol']:
-            # ..and backed up
-            status = ' '
-          else:
-            # ..and not backed up
-            status = '.'
-            nobackup_bytes += st.st_size
-        else:
-          # file is already known, but stat changed
-          cur.execute('UPDATE file SET st_mtime=%d, st_size=%d, disc_vol=NULL, '
-                      'disc_date=NULL WHERE id=%d;' % 
-                      (st.st_mtime, st.st_size, row['id']));
-          conn.commit()
-          status = '+'
-          new_bytes += st.st_size
-          nobackup_bytes += st.st_size
+  if verbose:
+    print 'Scanned %d files in %s.' % (len(files_on_disk.keys()), root_path)
+  
+  cur.execute('SELECT id, file, st_mtime, st_size, disc_vol FROM file WHERE '
+              'root=%d;' % rootid)
+  row = cur.fetchone()
+  while row:
+    digest = hashlib.md5(row['file']).digest()
+    files_in_db[digest] = (row['id'], row['file'], row['st_mtime'],
+                           row['st_size'], row['disc_vol'])
+    row = cur.fetchone()
+
+  if verbose:
+    print 'Loaded %d files from db.' % len(files_in_db.keys())
+
+  # first pass: forget anything that is identical in both places, update
+  # anything that exists in both but with different metadata.
+  to_delete = []
+  for hashval, row in files_on_disk.iteritems():
+    if hashval in files_in_db:
+      db_row = files_in_db[hashval]
+      assert row[PATH] == db_row[PATH]
+      if row[MTIME] == db_row[MTIME] and row[SIZE] == db_row[SIZE]:
+        if verbose: print '  ' + row[PATH]
+        # NB: can't actually delete from files_on_disk here, or the iterator
+        # will crap out.
+        to_delete.append(hashval)
+        files_identical += 1
       else:
-        # file has never been seen
-        cur.execute('INSERT INTO file (file, st_mtime, st_size, root) VALUES '
-                    '(%s, %d, %d, %d);' %
-                    (dbquote(path), st.st_mtime, st.st_size, rootid))
+        if verbose: print '! ' + row[PATH]
+        cur.execute('UPDATE file SET st_mtime=%d, st_size=%d, disc_vol=NULL, '
+                    'disc_date=NULL WHERE id=%d;'
+                    % (row[MTIME], row[SIZE], db_row[ID]))
         conn.commit()
-        status = '+'
-        new_bytes += st.st_size
-        nobackup_bytes += st.st_size
-      
-      if verbose: print status + ' ' + path
-      # to save memory, we remember only the 16-byte md5 hash of the filename
-      h = hashlib.new('md5')
-      h.update(path)
-      files_seen[h.digest()] = True
+        files_changed += 1
 
+  for hashval in to_delete:
+    del files_on_disk[hashval]
+    del files_in_db[hashval]
+  to_delete = None
 
-  # now check that all files not yet on a disc still exist
-  cur.execute('SELECT id, file FROM file WHERE root=%d AND disc_vol IS NULL;'
-              % rootid)
-  for row in cur.fetchall():
-    h = hashlib.new('md5')
-    h.update(row[1])
-    if h.digest() in files_seen:
-      del files_seen[h.digest()]
-    else:
-      cur.execute('DELETE FROM file WHERE id=%d;' % row[0])
-      conn.commit();
-      if verbose: print '- ' + row[1]
+  # second pass: anything left in files_on_disk is new
+  to_insert = []
+  for hashval, row in files_on_disk.iteritems():
+    if verbose: print '+ ' + row[PATH]
+    to_insert.append('(%s, %d, %d, %d)'
+                     % (dbquote(row[PATH]), row[MTIME], row[SIZE], rootid))
+    files_added += 1
+  if to_insert:
+    cur.execute('INSERT INTO file (file, st_mtime, st_size, root) VALUES '
+                + ','.join(to_insert) + ';')
+    conn.commit()
+  to_insert = None # release memory
+  files_on_disk = None
+
+  # third pass: anything left in files_in_db was deleted
+  to_delete = []
+  for hashval, row in files_in_db.iteritems():
+    if row[DISCVOL]: continue # no point deleting from catalog
+    if verbose: print '- ' + row[PATH]
+    to_delete.append(str(row[ID]))
+    files_deleted += 1
+  if to_delete:
+    cur.execute('DELETE FROM file WHERE ID IN (' + ','.join(to_delete) + ');')
+    conn.commit()
+  to_delete = None
+  files_in_db = None
 
   # use root entry's disc_date to record time of last scan
   cur.execute('UPDATE file SET disc_date=now() WHERE id=%d;' % rootid)
   conn.commit();
 
-  return new_bytes, nobackup_bytes
+  if verbose:
+    print '%8d files unchanged.' % files_identical
+    print '%8d files changed on disk.' % files_changed
+    print '%8d files new on disk.' % files_added
+    print '%8d un-archived files deleted on disk.' % files_deleted
 
+  return None
 
 
 if __name__ == '__main__':
