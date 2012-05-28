@@ -1,15 +1,17 @@
 #!/usr/bin/python
 """cdarc - Maintain an offline catalog of optical discs that mirror files on disk.
 
-Usage: cdarc [-r which] [-v] (scan | burn | status | init path label)
+Usage: cdarc [-r which] [-v] command
 
 -r: which root to operate on, can be specified by path or label
 -v: more verbosity
 
-scan: compare database records against disk, and update database
-burn: burn an optical disc with as many files as will fit, oldest first
-status: print some statistics
-init: create records for a new tree root (not implemented)
+command:
+  scan - compare database records against disk, and update database
+  burn - burn an optical disc with as many files as will fit, oldest first
+  status - print some statistics
+  init - create records for a new tree root (not implemented)
+  delete - delete all records associated with named root
 
 Copyright 2012 Michael Dickerson <mikey@singingtree.com>
 """
@@ -17,14 +19,27 @@ Copyright 2012 Michael Dickerson <mikey@singingtree.com>
 import getopt
 import hashlib
 import os
-import psycopg2 as pydbi # apt-get install python-psycopg2
-import psycopg2.extras
 import subprocess
 import sys
 import tempfile
 
+# -----------------------------------------------------------------
+# To adapt to whatever SQL database you have handy, you should only
+# need to modify these parts.
+
+import psycopg2 as pydbi # apt-get install python-psycopg2
+import psycopg2.extras
+
 DBSPEC='dbname=cdarc user=cdarc'
 
+def connect():
+  return pydbi.connect(DBSPEC)
+
+def dcursor(conn):
+  """Construct a dictionary cursor from conn."""
+  return conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
+
+# -----------------------------------------------------------------
 
 def humanize_bytes(b):
   """Convert 2220934 to '2.2M', etc."""
@@ -37,18 +52,6 @@ def humanize_bytes(b):
 def dbquote(s):
   """Enclose any string in ' and double any exising 's."""
   return "'" + s.replace("'", "''") + "'"
-
-
-def connect():
-  return pydbi.connect(DBSPEC)
-
-
-def dcursor(conn):
-  """Construct a dictionary cursor from conn.
-
-  If you need to change the factory class, you only have to do it here.
-  """
-  return conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
 
 def find_field(text, field):
@@ -293,9 +296,6 @@ def scan_tree(conn, root, verbose=False):
       assert row[PATH] == db_row[PATH]
       if row[MTIME] == db_row[MTIME] and row[SIZE] == db_row[SIZE]:
         if verbose: print '  ' + row[PATH]
-        # NB: can't actually delete from files_on_disk here, or the iterator
-        # will crap out.
-        to_delete.append(hashval)
         files_identical += 1
       else:
         if verbose: print '! ' + row[PATH]
@@ -304,6 +304,10 @@ def scan_tree(conn, root, verbose=False):
                     % (row[MTIME], row[SIZE], db_row[ID]))
         conn.commit()
         files_changed += 1
+      # NB: can't actually delete from files_on_disk here, or the iterator
+      # will crap out.
+      to_delete.append(hashval)
+
 
   for hashval in to_delete:
     del files_on_disk[hashval]
