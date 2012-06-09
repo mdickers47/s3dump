@@ -1,31 +1,29 @@
 #!/usr/bin/python
 """cdarc - Maintain an offline catalog of optical discs that mirror files on disk.
 
-Usage: cdarc [-r which] [-v] command
+Usage: cdarc [-r which] [-d /cdr/device] [-v] [-N] command
 
--r: which root to operate on, can be specified by path or label
+-r: which root to operate on; can be specified by path or label
+-d: use specified cdrom device (otherwise try to guess)
 -v: more verbosity
+-N: prepare and catalog an ISO image, but don't really burn
 
 command:
   scan - compare database records against disk, and update database
   burn - burn an optical disc with as many files as will fit, oldest first
   status - print some statistics
-  init - create records for a new tree root (not implemented)
+  selftest - check binaries, database, and disc status
+
+  TODO:
+  init - create records for a new tree root
   delete - delete all records associated with named root
 
 Copyright 2012 Michael Dickerson <mikey@singingtree.com>
 """
 
-import getopt
-import hashlib
-import os
-import subprocess
-import sys
-import tempfile
-
 # -----------------------------------------------------------------
 # To adapt to whatever SQL database you have handy, you should only
-# need to modify these parts.
+# need to modify this part.
 
 import psycopg2 as pydbi # apt-get install python-psycopg2
 import psycopg2.extras
@@ -40,6 +38,17 @@ def dcursor(conn):
   return conn.cursor(cursor_factory=psycopg2.extras.DictCursor)
 
 # -----------------------------------------------------------------
+
+import getopt
+import hashlib
+import os
+import re
+import subprocess
+import sys
+import tempfile
+
+ONE_GB = 2**30 # bytes
+
 
 def humanize_bytes(b):
   """Convert 2220934 to '2.2M', etc."""
@@ -62,29 +71,90 @@ def find_field(text, field):
   """
   for line in text.split('\n'):
     if not ':' in line: continue
-    key, val = map(lambda x: x.strip(), line.split(':'))
+    key, val = map(lambda x: x.strip(), line.split(':', 1))
     if key == field: return val
   return None
 
 
-def get_disc_device():
-  """Use wodim to guess the cd-rom device."""
-  dinfo = subprocess.check_output(['wodim', '-atip'], stderr=subprocess.STDOUT)
-  return find_field(dinfo, 'Detected CD-R drive')
-  
+def self_test():
 
-def get_disc_capacity(device):
+  def _check_process(args, expected=0):
+    null = open('/dev/null', 'w')
+    ret = subprocess.call(args, stdout=null, stderr=null)
+    if ret == expected:
+      print 'Able to execute %s' % args[0]
+      return True
+    else:
+      print 'Can\'t execute %s' % args[0]
+      return False
+
+  ok = True
+  ok &= _check_process(['wodim', '--version'])
+  ok &= _check_process(['dvd+rw-mediainfo'], expected=150)
+  ok &= _check_process(['growisofs', '-version'])
+  ok &= _check_process(['genisoimage', '-version'])
+
   try:
-    minfo = subprocess.check_output(['dvd+rw-mediainfo', device],
+    cur = dcursor(connect())
+    cur.execute('SELECT * FROM file LIMIT 1;')
+    cur.close()
+    print 'Database connection is ok'
+  except Exception, e:
+    print e
+    ok = False 
+
+  disc = get_disc_capacity()
+  print 'Media capacity appears to be: %s' % humanize_bytes(disc)
+  return ok
+
+
+def guess_disc_device():
+  """Use wodim to guess the cd-rom device.  wodim returns nonzero upon
+  successfully doing this.  Who writes this crap?
+  """
+  pipe = subprocess.Popen(['wodim', '--devices'], stdout=subprocess.PIPE)
+  stdout, stderr = pipe.communicate()
+  for line in stdout.split('\n'):
+    m = re.search(r"dev='([a-z0-9/]+)'\s+[rwx\-]{6} : '(.*?)' '(.*?)'", line)
+    if m:
+      print 'Using dev=%s (%s %s)' % (m.group(1), m.group(2), m.group(3))
+      return m.group(1)
+  print 'Unable to guess disc device'
+  return None
+
+
+def get_disc_capacity():
+  """Try to guess the blank disc capacity, in bytes.
+
+  First try dvd+rw-mediainfo, which works for anything except CDs.  Try
+  wodim -atip for CDs.  The many format codes for DVDs and BDs are defined
+  in:
+  ftp://ftp.avc-pioneer.com/Mtfuji_7/Proposal/Oct06/Pioneer/ \
+  READ_FORMAT_CAPACITIES.pdf
+  """
+  global DEVICE
+  try:
+    minfo = subprocess.check_output(['dvd+rw-mediainfo', DEVICE],
                                     stderr=subprocess.STDOUT)
+    # format type 00h is "full format":
+    capacity = find_field(minfo, '00h(3000)')
+    if not capacity:
+      # format type 26h is "DVD+RW basic format":
+      capacity = find_field(minfo, '26h(0)')
+    return int(capacity.split('=')[-1])
   except subprocess.CalledProcessError:
-    return 0 # no disc
-  blocks = find_field(minfo, 'Free Blocks')
-  assert blocks.endswith('*2KB')  # make smarter if necessary
-  return int(blocks[:-4]) * 2048
+    # no disc, or CD (unreadable by dvd+rw-mediainfo)
+    pass
+  try:
+    minfo = subprocess.check_output(['wodim', 'dev=%s' % DEVICE, '-atip'],
+                                    stderr=subprocess.STDOUT)
+    capacity = find_field(minfo, 'ATIP start of lead out')
+    return int(capacity.split()[0]) * 2048
+  except subprocess.CalledProcessError:
+    return 0
 
 
-def burn_disc(conn, rootid, capacity, label):
+def burn_disc(conn, rootid, capacity, label, fake_burn):
 
   fh, path_list = tempfile.mkstemp(prefix='cdarc_file_list_')
   img_size = 0
@@ -112,8 +182,14 @@ def burn_disc(conn, rootid, capacity, label):
   subprocess.check_call(['genisoimage', '-r', '-V', label, '-o', img_file,
                          '-graft-points', '-path-list', path_list, '-quiet'])
 
-  print 'Burning iso image.'
-  subprocess.check_call(['wodim', img_file])
+  if fake_burn:
+    print 'NOT BURNING, DO IT YOURSELF: %s' % img_file
+  elif capacity < ONE_GB:
+    print 'Burning CD image using wodim.'
+    subprocess.check_call(['wodim', 'dev=%s' % DEVICE, img_file])
+  else:
+    print 'Burning DVD/BD image using growisofs.'
+    subprocess.check_call(['growisofs', '-Z', '%s=%s' % (DEVICE, img_file)])
   print
   print 'Updating file catalog (%d files stored).' % len(img_file_ids)
   for fid in img_file_ids:
@@ -121,9 +197,13 @@ def burn_disc(conn, rootid, capacity, label):
                 'WHERE id=%d;' % (dbquote(label), fid))
   conn.commit()
 
-  print 'Cleaning up temporary files.'
-  os.unlink(path_list)
-  os.unlink(img_file)
+  if fake_burn:
+    print 'NOT DELETING, DO IT YOURSELF: %s' % path_list
+    print 'NOT DELETING, DO IT YOURSELF: %s' % img_file
+  else:
+    print 'Cleaning up temporary files.'
+    os.unlink(path_list)
+    os.unlink(img_file)
   print 'Done.'
 
 
@@ -229,16 +309,6 @@ def print_status(conn, root):
   print 'Archived bytes: %ld (%s)' % (row['bytes'] or 0,
                                       humanize_bytes(row['bytes'] or 0))
 
-
-
-def scan_all(conn):
-  """Fetch all of the root paths from the table, run scan_tree on them.
-
-  Args: conn - dbi connection
-  Returns: None
-  """
-  for root in get_roots(conn): scan_tree(conn, root)
-    
 
 def scan_tree(conn, root, verbose=False):
   """Find all files under the given root, check for them in the database table,
@@ -356,19 +426,24 @@ def scan_tree(conn, root, verbose=False):
 
 if __name__ == '__main__':
 
+  global DEVICE
+  DEVICE = None
   conn = connect()
   verbose = False
+  fake_burn = False
   which_root = None
   disc_label = None
   command = None
   roots = []
 
   try:
-    opts, remainder = getopt.getopt(sys.argv[1:], 'vr:l:')
+    opts, remainder = getopt.getopt(sys.argv[1:], 'd:vr:l:N')
     opts = dict(opts)
+    if '-d' in opts: DEVICE = opts['-d']
     if '-v' in opts: verbose = True
     if '-r' in opts: roots.append(get_root(conn, opts['-r']))
     if '-l' in opts: disc_label = opts['-l']
+    if '-N' in opts: fake_burn = True
     command = remainder[0]
     remainder = remainder[1:]
   except (getopt.GetoptError, IndexError), e:
@@ -376,20 +451,24 @@ if __name__ == '__main__':
     sys.stderr.write(__doc__)
     sys.exit(1)
 
-  if not roots: roots = get_roots(conn)
-
   if command == 'scan':
+    if not roots: roots = get_roots(conn)
     for root in roots:
       scan_tree(conn, root, verbose)
   elif command == 'burn':
     if len(roots) > 1:
       sys.stderr.write('must specify which root.\n')
       sys.exit(1)
+    if not DEVICE: DEVICE = guess_disc_device()
     if not disc_label: disc_label = guess_label(conn, roots[0])
-    capacity = get_disc_capacity(get_disc_device())
-    burn_disc(conn, roots[0][0], capacity, disc_label)
+    capacity = get_disc_capacity()
+    burn_disc(conn, roots[0][0], capacity, disc_label, fake_burn)
   elif command == 'status':
+    if not roots: roots = get_roots(conn)
     for root in roots: print_status(conn, root)
+  elif command == 'selftest':
+    if not DEVICE: DEVICE = guess_disc_device()
+    self_test()
   else:
     sys.stderr.write(__doc__)
     sys.exit(1)
