@@ -292,7 +292,7 @@ def print_status(conn, root):
               'WHERE root=%d AND disc_vol IS NULL;' % rootid)
   row = cur.fetchone()
   print 'New files: %d' % row['fc']
-  print 'New bytes: %ld (%s)' % (row['bytes'], 
+  print 'New bytes: %ld (%s)' % (row['bytes'] or 0, 
                                  humanize_bytes(row['bytes']))
   cur.execute('SELECT count(DISTINCT disc_vol) AS av FROM file '
               'WHERE root=%d;' % rootid)
