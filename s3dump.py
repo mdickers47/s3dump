@@ -38,6 +38,7 @@ import xml.sax
 # Hard code your public and secret key if you want to.  Otherwise they
 # will be read from a file in /etc.
 
+BUCKET_NAME = None
 AWS_ACCESS_KEY_ID = None
 AWS_SECRET_ACCESS_KEY = None
 HOSTNAME = socket.gethostname().split('.')[0].strip()
@@ -45,11 +46,18 @@ DEFAULT_KEEP = 2
 
 # Nothing below this line should need to be changed.
 
-if None in (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY):
-  fh = open('/etc/s3_keys', 'r')
-  AWS_ACCESS_KEY_ID = fh.readline().strip()
-  AWS_SECRET_ACCESS_KEY = fh.readline().strip()
-  fh.close()
+if None in (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, BUCKET_NAME):
+  with open('/etc/s3_keys', 'r') as fh:
+    for line in fh:
+      key, val = line.split('=')
+      if key == 'key_id':
+        AWS_ACCESS_KEY_ID = val.strip()
+      elif key == 'secret_key':
+        AWS_SECRET_ACCESS_KEY = val.strip()
+      elif key == 'bucket':
+        BUCKET_NAME = val.strip()
+      else:
+        print 'Bad config line: %s' % line
 
 BLOCK_SIZE = 10 * 1024 # default dump block size is 10k
 S3_CHUNK_SIZE = 1024 * 1024 * 50 # 50MB
@@ -57,7 +65,7 @@ DATE_FMT = '%Y-%m-%d'
 DEFAULT_HOST = 's3.amazonaws.com'
 METADATA_PREFIX = 'x-amz-meta-'
 AMAZON_HEADER_PREFIX = 'x-amz-'
-BUCKET_NAME = AWS_ACCESS_KEY_ID + '-dumps'
+BUCKET_NAME = BUCKET_NAME or AWS_ACCESS_KEY_ID + '-dumps'
 
 # generates the aws canonical string for the given parameters
 def canonical_string(method, path, headers, expires=None):
@@ -670,6 +678,7 @@ if __name__ == '__main__':
               DeleteChunkedFile(conn, ':'.join([h, fs, level, d]))
       
   elif '-l' in opts:
+    print 'Using bucket %s' % BUCKET_NAME
     conn = AWSAuthConnection(is_secure=False)
     dumps = RetrieveDumpTree(conn)
     total = 0L
@@ -685,7 +694,7 @@ if __name__ == '__main__':
         total += PrintDumpTree(dumps[h])
     print
     print 'Total data stored: %s ($%.2f/month)' % \
-      (HumanizeBytes(total), total / (2**30) * 0.14)
+      (HumanizeBytes(total), total / (2**30) * 0.095)
 
   elif '-r' in opts:
     conn = AWSAuthConnection(is_secure=False)
