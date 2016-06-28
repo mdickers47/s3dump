@@ -161,6 +161,7 @@ class AWSAuthConnection:
       for e in lst.entries:
         self.entries.append(e)
 
+      print dir(lst)
       if not lst.is_truncated:
         break
 
@@ -253,6 +254,9 @@ class S3Object:
     self.metadata = metadata
 
 
+class ListBucketError(Exception): pass
+
+
 class ListBucketResponse:
   def __init__(self, http_response):
     self.body = http_response.read()
@@ -269,7 +273,8 @@ class ListBucketResponse:
       self.max_keys = handler.max_keys
       self.next_marker = handler.next_marker
     else:
-      self.entries = []
+      raise ListBucketError('HTTP error %d' % http_response.status)
+      #self.entries = []
 
 
 class Owner:
