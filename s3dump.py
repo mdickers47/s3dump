@@ -144,7 +144,6 @@ class AWSAuthConnection:
     else:
       self.connection = httplib.HTTPConnection("%s:%d" % (server, port))
 
-
   def create_bucket(self, bucket, headers={}):
     return self.make_request('PUT', bucket, headers)
 
@@ -161,7 +160,6 @@ class AWSAuthConnection:
       for e in lst.entries:
         self.entries.append(e)
 
-      print dir(lst)
       if not lst.is_truncated:
         break
 
@@ -419,6 +417,7 @@ class ChunkUploader(threading.Thread):
       while tries:
         try:
           print 'uploader: key is %s (%ld bytes)' % (key, bytes)
+          self.conn = AWSAuthConnection(is_secure=True)
           self.conn.open_stream(BUCKET_NAME, key, bytes)
           read_ptr = start_ptr
           while read_ptr != stop_ptr:
@@ -426,6 +425,7 @@ class ChunkUploader(threading.Thread):
             read_ptr = (read_ptr + 1) % len(self.ringbuf)
           response = self.conn.close_stream()
           response.read() # have to read() before starting a new request
+          self.conn = None
           if response.status >= 300:
             raise Exception, 'Amazon returned error %d: %s' % \
                   (response.status, response.reason)
@@ -442,7 +442,6 @@ class ChunkUploader(threading.Thread):
           sys.stderr.write('trying again in %ds (%d remaining).\n' % \
                              (to_sleep, tries))
           time.sleep(to_sleep)
-          self.conn = AWSAuthConnection(is_secure=True)
       else:
         # kill this thread
         return
