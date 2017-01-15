@@ -144,6 +144,9 @@ class AWSAuthConnection:
     else:
       self.connection = httplib.HTTPConnection("%s:%d" % (server, port))
 
+  def close(self):
+    self.connection.close()
+    
   def create_bucket(self, bucket, headers={}):
     return self.make_request('PUT', bucket, headers)
 
@@ -701,18 +704,19 @@ if __name__ == '__main__':
       (HumanizeBytes(total), total / (2**30) * 0.095)
 
   elif '-r' in opts:
-    conn = AWSAuthConnection(is_secure=False)
     if '-w' in opts:
       date = opts['-w']
     else:
-      dumps = RetrieveDumpTree(conn)[host][filesystem][level]
+      dumps = RetrieveDumpTree(AWSAuthConnection())[host][filesystem][level]
       dates = dumps.keys()
       dates.sort()
-      date = dates[0] ## #XXXXXXXn
-    conn = AWSAuthConnection(is_secure=False)
-    for chunk in ListChunks(conn, ':'.join([host, filesystem, level, date])):
-      sys.stderr.write('Reading chunk %s\n' % chunk)
-      response = conn.get(BUCKET_NAME, chunk)
+      date = dates[-1]
+    
+    chunks = ListChunks(AWSAuthConnection(), ':'.join([host, filesystem, level, date]))
+    
+    for chunk in chunks:
+      sys.stderr.write('Reading chunk %s of %d\n' % (chunk, len(chunks)))
+      response = AWSAuthConnection().get(BUCKET_NAME, chunk)
       if response.http_response.status != 200: break
       sys.stdout.write(response.object.data)
 
