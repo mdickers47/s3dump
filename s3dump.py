@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/env python
 #
 # s3dump.py - Similar to a tape driver, in that you pour bits in or
 # pour them out.  Meant to be used with dump/restore, but doesn't care
