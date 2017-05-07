@@ -701,7 +701,7 @@ if __name__ == '__main__':
         total += PrintDumpTree(dumps[h])
     print
     print 'Total data stored: %s ($%.2f/month)' % \
-      (HumanizeBytes(total), total / (2**30) * 0.095)
+      (HumanizeBytes(total), total / (2**30) * 0.023)
 
   elif '-r' in opts:
     if '-w' in opts:
