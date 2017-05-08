@@ -26,7 +26,6 @@ import hashlib
 import hmac
 import httplib
 import getopt
-import os
 import re
 import socket
 import sys
@@ -35,54 +34,60 @@ import time
 import urllib
 import xml.sax
 
-# Hard code your public and secret key if you want to.  Otherwise they
-# will be read from a file in /etc.
-
-BUCKET_NAME = None
-AWS_ACCESS_KEY_ID = None
-AWS_SECRET_ACCESS_KEY = None
 HOSTNAME = socket.gethostname().split('.')[0].strip()
 DEFAULT_KEEP = 2
-
-# Nothing below this line should need to be changed.
-
-if None in (AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, BUCKET_NAME):
-  with open('/etc/s3_keys', 'r') as fh:
-    for line in fh:
-      key, val = line.split('=')
-      if key == 'key_id':
-        AWS_ACCESS_KEY_ID = val.strip()
-      elif key == 'secret_key':
-        AWS_SECRET_ACCESS_KEY = val.strip()
-      elif key == 'bucket':
-        BUCKET_NAME = val.strip()
-      else:
-        print 'Bad config line: %s' % line
-
+CONFIG_FILE = '/etc/s3_keys'
 BLOCK_SIZE = 10 * 1024 # default dump block size is 10k
 S3_CHUNK_SIZE = 1024 * 1024 * 50 # 50MB
 DATE_FMT = '%Y-%m-%d'
-DEFAULT_HOST = 's3.amazonaws.com'
 METADATA_PREFIX = 'x-amz-meta-'
-AMAZON_HEADER_PREFIX = 'x-amz-'
-BUCKET_NAME = BUCKET_NAME or AWS_ACCESS_KEY_ID + '-dumps'
+
+# Nothing below this line should need to be changed.
+
+class AWSConfigError(Exception): pass
+
+class AWSConfig(object):
+  def __init__(self, config_file=None):
+    self.access_key_id = None
+    self.secret_access_key = None
+    self.bucket_name = None
+
+    if config_file:
+      with open(config_file, 'r') as fh:
+        for line in fh:
+          if line.startswith('#'): continue
+          key, val = line.split('=')
+          if key == 'key_id':
+            self.access_key_id = val.strip()
+          elif key == 'secret_key':
+            self.secret_access_key = val.strip()
+          elif key == 'bucket':
+            self.bucket_name = val.strip()
+          else:
+            raise AWSConfigError('bad config line: %s' % line)
+
+    if not self.access_key_id:
+      raise AWSConfigError('key_id must be defined')
+    if not self.secret_access_key:
+      raise AWSConfigError('secret_key must be defined')
+    if not self.bucket_name:
+      self.bucket_name = self.access_key_id + '-dumps'
 
 # generates the aws canonical string for the given parameters
 def canonical_string(method, path, headers, expires=None):
-  interesting_headers = {}
-  for key in headers:
-    lk = key.lower()
-    if lk in ['content-md5', 'content-type', 'date'] or lk.startswith(AMAZON_HEADER_PREFIX):
-      interesting_headers[lk] = headers[key].strip()
+  interesting_headers = {
+    'content-type' : '',
+    'content-md5'  : '',
+  }
 
-  # these keys get empty strings if they don't exist
-  if not interesting_headers.has_key('content-type'):
-    interesting_headers['content-type'] = ''
-  if not interesting_headers.has_key('content-md5'):
-    interesting_headers['content-md5'] = ''
+  for key, val in headers.items():
+    lk = key.lower()
+    if (lk in ['content-md5', 'content-type', 'date']
+        or lk.startswith('x-amz-')):
+      interesting_headers[lk] = val.strip()
 
   # just in case someone used this.  it's not necessary in this lib.
-  if interesting_headers.has_key('x-amz-date'):
+  if 'x-amz-date' in interesting_headers:
     interesting_headers['date'] = ''
 
   # if you're using expires for query string auth, then it trumps date
@@ -90,18 +95,16 @@ def canonical_string(method, path, headers, expires=None):
   if expires:
     interesting_headers['date'] = str(expires)
 
-  sorted_header_keys = interesting_headers.keys()
-  sorted_header_keys.sort()
-
   buf = "%s\n" % method
-  for key in sorted_header_keys:
-    if key.startswith(AMAZON_HEADER_PREFIX):
+  for key in sorted(interesting_headers.keys()):
+    if key.startswith('x-amz-'):
       buf += "%s:%s\n" % (key, interesting_headers[key])
     else:
       buf += "%s\n" % interesting_headers[key]
 
   # don't include anything after the first ? in the resource...
-  buf += "/%s" % path.split('?')[0]
+  if not path.startswith('/'): buf += '/'
+  buf += path.split('?')[0]
 
   # ...unless there is an acl or torrent parameter
   if re.search("[&?]acl($|=|&)", path):
@@ -112,90 +115,141 @@ def canonical_string(method, path, headers, expires=None):
   return buf
 
 
-# computes the base64'ed hmac-sha hash of the canonical string and the secret
-# access key, optionally urlencoding the result
-def encode(aws_secret_access_key, str, urlencode=False):
-  b64_hmac = base64.encodestring(hmac.new(aws_secret_access_key, str,
-                                          hashlib.sha1).digest()).strip()
-  if urlencode:
-    return urllib.quote_plus(b64_hmac)
-  else:
-    return b64_hmac
+def compute_hmac(secret_key, data):
+  hm = hmac.new(secret_key, data, hashlib.sha1)
+  return base64.encodestring(hm.digest()).strip()
 
+class S3BucketError(Exception): pass
 
-def merge_meta(headers, metadata):
-  final_headers = headers.copy()
-  for k in metadata.keys():
-    final_headers[METADATA_PREFIX + k] = metadata[k]
-  return final_headers
+class S3Bucket:
 
+  def __init__(self, aws_config, server='s3.amazonaws.com'):
+    self.aws_access_key_id = aws_config.access_key_id
+    self.aws_secret_access_key = aws_config.secret_access_key
+    self.bucket = aws_config.bucket_name
+    self.connection = httplib.HTTPSConnection(server)
+    self.debug_log = None
 
-class AWSAuthConnection:
-    
-  def __init__(self, is_secure=True, server=DEFAULT_HOST, port=None):
+  def _debug(self, msg):
+    if self.debug_log: self.debug_log.write(msg, '\n')
+    #print msg
 
-    if not port:
-      port = {True: httplib.HTTPS_PORT, False: httplib.HTTP_PORT}[is_secure]
-
-    self.aws_access_key_id = AWS_ACCESS_KEY_ID
-    self.aws_secret_access_key = AWS_SECRET_ACCESS_KEY
-    if (is_secure):
-      self.connection = httplib.HTTPSConnection("%s:%d" % (server, port))
+  def _make_request(self, method, path, headers=None, s3obj=None,
+                    open_stream=False):
+    if headers:
+      h = headers.copy()
     else:
-      self.connection = httplib.HTTPConnection("%s:%d" % (server, port))
+      h = {}
+    if method == 'PUT' and s3obj:
+      for k, v in s3obj.metadata.items(): h[METADATA_PREFIX + k] = v
+    elif method == 'PUT' and not s3obj:
+      raise S3BucketError('missing object to put request')
+    elif method != 'PUT' and s3obj:
+      raise S3BucketError('non-PUT request cannot take an object')
+
+    if not path.startswith('/'): path = '/' + path
+    
+    if not 'Date' in h:
+      h['Date'] = time.strftime('%a, %d %b %Y %X GMT', time.gmtime())
+
+    # sign the request with 'Authorization' header
+    c_string = canonical_string(method, path, h)
+    hmac = compute_hmac(self.aws_secret_access_key, c_string)
+    h['Authorization'] = 'AWS %s:%s' % (self.aws_access_key_id, hmac)
+
+    self._debug('Request: %s %s' % (method, path))
+    #self._debug('Canonical string: %s' % c_string)
+    #self._debug('Authorization header: %s' % h['Authorization'])
+    
+    if open_stream:
+      self.connection.putrequest(method, path)
+      for k, v in h: self.connection.putheader(k, v)
+      self.connection.endheaders()
+      if s3obj: self.connection.send(s3obj.data)
+      ret = None
+    else:
+      if s3obj:
+        data = s3obj.data
+      else:
+        data = ''
+      self.connection.request(method, path, '', h)
+      ret = self.connection.getresponse()
+      self._debug('Response status: %s' % ret.status)
+
+    return ret
 
   def close(self):
     self.connection.close()
-    
-  def create_bucket(self, bucket, headers={}):
-    return self.make_request('PUT', bucket, headers)
 
-  def list_bucket(self, bucket, options={}, headers={}):
+  def create_bucket(self, headers=None):
+    return self._make_request('PUT', self.bucket, headers=headers)
+
+  def delete_bucket(self, headers=None):
+    return self._make_request('DELETE', self.bucket, headers=headers)
+
+  def get_bucket_acl(self, headers=None):
+    return self.get_acl('', headers=headers)
+
+  def put_bucket_acl(self, acl_xml_document, headers=None):
+    return self.put_acl('', acl_xml_document, headers=headers)
+  
+  def list_bucket(self, options=None, headers=None):
     self.entries = []
+    if not options: options = {} # this silences a pychecker error
     while True:
-      path = bucket
+      path = '/' + self.bucket
       if options:
-        path += '?'
-        path += '&'.join(["%s=%s" % (param, urllib.quote_plus(str(options[param]))) for param in options])
+        stringify = lambda p: '%s=%s' % (p, urllib.quote_plus(str(options[p])))
+        path += '?' + '&'.join(map(stringify, options.keys()))
 
-      lst = ListBucketResponse(self.make_request('GET', path, headers))
+      lst = ListBucketResponse(self._make_request('GET', path,
+                                                  headers=headers))
 
-      for e in lst.entries:
-        self.entries.append(e)
-
-      if not lst.is_truncated:
-        break
+      self.entries.extend(lst.entries)
+      if not lst.is_truncated: break
 
       # re-request with the marker set at the last one we got
       # this time round. This sort of conflicts with the NextMarker
       # code posted all over the web - but seems to work an dovetails
-      # nicely with http://docs.amazonwebservices.com/AmazonS3/latest/API/RESTBucketGET.html
-      #
-      options.update({'marker': self.entries[-1].key})
-
+      # nicely with
+      # http://docs.amazonwebservices.com/AmazonS3/latest/API/RESTBucketGET.html
+      options['marker'] = self.entries[-1].key
+      
     return self
 
-  def delete_bucket(self, bucket, headers={}):
-    return self.make_request('DELETE', bucket, headers)
-
-  def put(self, bucket, key, obj, headers={}):
+  def put(self, key, obj, headers=None, open_stream=False):
     if not isinstance(obj, S3Object): obj = S3Object(obj)
+    r = self._make_request('PUT',
+                           '/%s/%s' % (self.bucket, urllib.quote_plus(key)),
+                           headers=headers,
+                           s3obj=obj,
+                           open_stream=open_stream)
+    return r
 
-    return self.make_request('PUT',
-                             '%s/%s' % (bucket, urllib.quote_plus(key)),
-                             headers,
-                             obj.data,
-                             obj.metadata)
+  def get(self, key, headers=None):
+    r = self._make_request('GET',
+                           '/%s/%s' % (self.bucket, urllib.quote_plus(key)),
+                           headers=headers)
+    return GetResponse(r)
+  
+  def delete(self, key, headers=None):
+    r = self._make_request('DELETE',
+                           '/%s/%s' % (self.bucket, urllib.quote_plus(key)),
+                           headers=headers)
+    return r
 
-  def open_stream(self, bucket, key, datalen):
-    # add auth header
-    path = '%s/%s' % (bucket, urllib.quote_plus(key))
-    headers = { 'Content-Length': datalen }
-    self.add_aws_auth_header(headers, 'PUT', path)
-    self.connection.putrequest('PUT', '/' + path)
-    for h in headers:
-      self.connection.putheader(h, headers[h])
-    self.connection.endheaders()
+  def put_acl(self, key, acl_xml_document, headers=None):
+    r = self._make_request('PUT',
+                           '%s/%s?acl' % (self.bucket, urllib.quote_plus(key)),
+                           headers=headers,
+                           s3obj=acl_xml_document)
+    return r
+  
+  def get_acl(self, key, headers=None):
+    r = self._make_request('GET',
+                           '/%s/%s?acl' % (self.bucket, urllib.quote_plus(key)),
+                           headers=headers)
+    return GetResponse(r)
 
   def send_stream(self, data):
     self.connection.send(data)
@@ -203,51 +257,6 @@ class AWSAuthConnection:
   def close_stream(self):
     return self.connection.getresponse()
     
-  def get(self, bucket, key, headers={}):
-    return GetResponse(self.make_request('GET',
-                                         '%s/%s' % (bucket, urllib.quote_plus(key)),
-                                         headers))
-
-  def delete(self, bucket, key, headers={}):
-    return self.make_request('DELETE',
-                             '%s/%s' % (bucket, urllib.quote_plus(key)),
-                             headers)
-
-  def get_bucket_acl(self, bucket, headers={}):
-    return self.get_acl(bucket, '', headers)
-
-  def get_acl(self, bucket, key, headers={}):
-    return GetResponse(self.make_request('GET',
-                                         '%s/%s?acl' % (bucket, urllib.quote_plus(key)),
-                                         headers))
-
-  def put_bucket_acl(self, bucket, acl_xml_document, headers={}):
-    return self.put_acl(bucket, '', acl_xml_document, headers)
-
-  def put_acl(self, bucket, key, acl_xml_document, headers={}):
-    return self.make_request('PUT',
-                             '%s/%s?acl' % (bucket, urllib.quote_plus(key)),
-                             headers,
-                             acl_xml_document)
-
-  def make_request(self, method, path, headers=None, data='', metadata={}):
-    if not headers: headers = {}
-    final_headers = merge_meta(headers, metadata);
-    # add auth header
-    self.add_aws_auth_header(final_headers, method, path)
-    self.connection.request(method, "/%s" % path, data, final_headers)
-    return self.connection.getresponse()
-
-
-  def add_aws_auth_header(self, headers, method, path):
-    if not headers.has_key('Date'):
-      headers['Date'] = time.strftime("%a, %d %b %Y %X GMT", time.gmtime())
-
-    c_string = canonical_string(method, path, headers)
-    headers['Authorization'] = \
-           "AWS %s:%s" % (self.aws_access_key_id,
-                          encode(self.aws_secret_access_key, c_string))
-
 
 class S3Object:
   def __init__(self, data, metadata={}):
@@ -390,18 +399,17 @@ class ListBucketHandler(xml.sax.ContentHandler):
 
 class ChunkUploader(threading.Thread):
   
-  def __init__(self, queue, ringbuf, key_prefix, ratelimit):
+  def __init__(self, queue, ringbuf, key_prefix, ratelimit, aws_config):
     threading.Thread.__init__(self)
     self.queue = queue
     self.ringbuf = ringbuf
     self.key_prefix = key_prefix
-
     self.ratelimit = ratelimit
+    self.aws_config = aws_config
     self.conn = None
     self.writes = []
 
   def run(self):
-    self.conn = AWSAuthConnection(is_secure=True)
     chunk = 0
     read_ptr = 0
     while True:
@@ -409,25 +417,26 @@ class ChunkUploader(threading.Thread):
       if stop_ptr == -1: break # all done
 
       print 'uploader: uploading blocks [%d,%d)' % (read_ptr, stop_ptr)
-      bytes = 0
+      byte_count = 0
       i = start_ptr = read_ptr
       while i != stop_ptr:
-        bytes += len(self.ringbuf[i])
+        byte_count += len(self.ringbuf[i])
         i = (i + 1) % len(self.ringbuf)
       key = '%s:%s' % (self.key_prefix, chunk)
 
       tries = 20
       while tries:
         try:
-          print 'uploader: key is %s (%ld bytes)' % (key, bytes)
-          self.conn = AWSAuthConnection(is_secure=True)
-          self.conn.open_stream(BUCKET_NAME, key, bytes)
+          print 'uploader: key is %s (%ld bytes)' % (key, byte_count)
+          self.conn = S3Bucket(self.aws_config)
+          self.conn.put(key, bytes, open_stream=True)
           read_ptr = start_ptr
           while read_ptr != stop_ptr:
             self.send_with_ratelimit(self.ringbuf[read_ptr])
             read_ptr = (read_ptr + 1) % len(self.ringbuf)
           response = self.conn.close_stream()
           response.read() # have to read() before starting a new request
+          self.conn.close()
           self.conn = None
           if response.status >= 300:
             raise Exception, 'Amazon returned error %d: %s' % \
@@ -461,15 +470,14 @@ class ChunkUploader(threading.Thread):
 
   def send_with_ratelimit(self, data):
     now = time.time()
-    i = 0
     sent_last_sec = self.ratelimit
     to_send = len(data)
 
     while self.ratelimit and sent_last_sec + to_send > self.ratelimit:
       sent_last_sec = 0
-      for (bytes, when) in self.writes:
+      for (byte_count, when) in self.writes:
         if now - when < 1:
-          sent_last_sec += bytes
+          sent_last_sec += byte_count
           if sent_last_sec + to_send > self.ratelimit:
             # sleep long enough for the budget breaker to rotate out
             to_sleep = 1 - (now - when)
@@ -494,7 +502,7 @@ def _SortByChunkNumber(a, b):
 
 
 def ListChunks(conn, prefix):
-  keys = [ x.key for x in conn.list_bucket(BUCKET_NAME).entries ]
+  keys = [ x.key for x in conn.list_bucket().entries ]
   keys = filter(lambda x: x.startswith(prefix), keys)
   keys.sort(_SortByChunkNumber)
   return keys
@@ -504,7 +512,7 @@ def DeleteChunkedFile(conn, prefix):
   #print 'delete %s' % prefix
   #return ### TEST
   for k in ListChunks(conn, prefix):
-    res = conn.delete(BUCKET_NAME, k)
+    res = conn.delete(k)
     res.read() # have to read() before you can start a new request
     if res.status >= 300:
       print 'deleting %s, Amazon returned error %d: %s' % \
@@ -524,7 +532,7 @@ def RetrieveDumpTree(conn):
   #     |-- filesystem /home
   #     +-- ...
   dumps = { }
-  for e in conn.list_bucket(BUCKET_NAME).entries:
+  for e in conn.list_bucket().entries:
     try:
       host, fs, level, date, chunk = e.key.split(':')
     except ValueError:
@@ -593,6 +601,13 @@ def usage():
 
 if __name__ == '__main__':
 
+  try:
+    config = AWSConfig(config_file=CONFIG_FILE)
+  except AWSConfigError, e:
+    sys.stderr.write('Error in config file %s: %s' % (CONFIG_FILE, e))
+    sys.exit(1)
+                     
+  
   # parse command line
   try:
     opts, remainder = getopt.getopt(sys.argv[1:], 'drilac:h:w:L:')
@@ -624,12 +639,13 @@ if __name__ == '__main__':
 
   if '-i' in opts:
     # initialize dumps bucket
-    print 'Creating bucket %s' % BUCKET_NAME
-    conn = AWSAuthConnection(is_secure=False)
-    print conn.create_bucket(BUCKET_NAME).reason
+    print 'Creating bucket %s' % config.bucket_name
+    conn = S3Bucket(config)
+    print conn.create_bucket().reason
 
-    print conn.put(BUCKET_NAME, 'testkey', S3Object('this is a test')).reason
-    print conn.delete(BUCKET_NAME, 'testkey').reason
+    print conn.put('testkey', S3Object('this is a test')).reason
+    print conn.get('testkey').reason
+    print conn.delete('testkey').reason
 
   elif '-d' in opts:
     # dump data to s3
@@ -643,7 +659,8 @@ if __name__ == '__main__':
     chunk_queue = Queue.Queue()
     date = opts.get('-w', time.strftime(DATE_FMT))
     key_prefix = '%s:%s:%s:%s' % (host, filesystem, level, date)
-    uploader = ChunkUploader(chunk_queue, block_buf, key_prefix, ratelimit)
+    uploader = ChunkUploader(chunk_queue, block_buf, key_prefix,
+                             ratelimit, config)
     uploader.setDaemon(True)
     uploader.start()
     
@@ -671,7 +688,7 @@ if __name__ == '__main__':
 
   elif '-c' in opts:
     # delete expired dumps
-    conn = AWSAuthConnection(is_secure=False)
+    conn = S3Bucket(config)
     dumps = RetrieveDumpTree(conn)
     for h in dumps.keys():
       if host == h or '-a' in opts:
@@ -685,9 +702,13 @@ if __name__ == '__main__':
               DeleteChunkedFile(conn, ':'.join([h, fs, level, d]))
       
   elif '-l' in opts:
-    print 'Using bucket %s' % BUCKET_NAME
-    conn = AWSAuthConnection(is_secure=False)
-    dumps = RetrieveDumpTree(conn)
+    print 'Using bucket %s' % config.bucket_name
+    conn = S3Bucket(config)
+    try:
+      dumps = RetrieveDumpTree(conn)
+    except ListBucketError, e:
+      print 'Error reading from S3: %s' % e
+      sys.exit(1)
     total = 0L
     if host in dumps:
       print 'Dumps for this host (%s):' % host
@@ -704,19 +725,20 @@ if __name__ == '__main__':
       (HumanizeBytes(total), total / (2**30) * 0.023)
 
   elif '-r' in opts:
+    conn = S3Bucket(config)
     if '-w' in opts:
       date = opts['-w']
     else:
-      dumps = RetrieveDumpTree(AWSAuthConnection())[host][filesystem][level]
+      dumps = RetrieveDumpTree(conn)[host][filesystem][level]
       dates = dumps.keys()
       dates.sort()
       date = dates[-1]
     
-    chunks = ListChunks(AWSAuthConnection(), ':'.join([host, filesystem, level, date]))
+    chunks = ListChunks(conn, ':'.join([host, filesystem, level, date]))
     
     for chunk in chunks:
       sys.stderr.write('Reading chunk %s of %d\n' % (chunk, len(chunks)))
-      response = AWSAuthConnection().get(BUCKET_NAME, chunk)
+      response = conn.get(chunk)
       if response.http_response.status != 200: break
       sys.stdout.write(response.object.data)
 
