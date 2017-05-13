@@ -1,19 +1,37 @@
-#
-# Copyright 2006-2017 Mikey Dickerson (mikey@singingtree.com).
-# Use permitted under the same terms as the license provided with the
-# Amazon code, below.
-#
-# Some parts, mostly AWSAuthConnection,  were taken from Amazon's sample
-# s3 implementation.  The license that came with that code is:
-#
-#  This software code is made available "AS IS" without warranties of any
-#  kind.  You may copy, display, modify and redistribute the software
-#  code either by itself or as incorporated into your code; provided that
-#  you do not remove any proprietary notices.  Your use of this software
-#  code is at your own risk and you waive any claim against Amazon
-#  Digital Services, Inc. or its affiliates with respect to your use of
-#  this software code. (c) 2006 Amazon Digital Services, Inc. or its
-#  affiliates.
+#!/usr/bin/env python
+"""Amazon S3 API client in plain Python.
+
+This is a plain-jane python library that implements several Amazon
+AWS REST client functions with the 'version 4' signature scheme.
+
+Mainly you need to instantiate an AWSConfig by supplying a path to a
+config file.  The config file must at least provide an API key and
+bucket name.  You then instantiate a Bucket using the AWSConfig.  The
+Bucket now provides get(), put(), list(), and other things vaguely
+similar to a key-value blob store.
+
+StoreChunkedFile, RetrieveChunkedFile, and DeleteChunkedFile implement
+a crude mechanism for making operations with very large files more
+reliable.  There is not much need for them since the API now provides
+multipart upload and download.
+
+This started in 2006 with some ingredients taken from Amazon sample
+code.  Since then, calling conventions and signature requirements have
+all changed, so there is little to none of that code left.
+Nevertheless, the following is a notice that came with it:
+
+  This software code is made available "AS IS" without warranties of any
+  kind.  You may copy, display, modify and redistribute the software
+  code either by itself or as incorporated into your code; provided that
+  you do not remove any proprietary notices.  Your use of this software
+  code is at your own risk and you waive any claim against Amazon
+  Digital Services, Inc. or its affiliates with respect to your use of
+  this software code. (c) 2006 Amazon Digital Services, Inc. or its
+  affiliates.
+
+The rest is Copyright 2006-2017 Mikey Dickerson.  Use is permitted
+under the same terms as the above notice.
+"""
 
 import hashlib
 import hmac
@@ -73,18 +91,15 @@ class AWSConfig(object):
           else:
             raise AWSConfigError('config line not understood: %s' % line)
 
-    if not self.access_key_id:
-      raise AWSConfigError('key_id must be defined')
-    if not self.secret_access_key:
-      raise AWSConfigError('secret_key must be defined')
-    if not self.bucket_name:
-      self.bucket_name = self.access_key_id + '-dumps'
+    for s in ('access_key_id', 'secret_access_key', 'bucket_name'):
+      if not self.__dict__[s]:
+        raise AWSConfigError('%s must be defined' % s)
 
 
 def canonical_string_v4(method, path, headers):
-  """Refer to AWS documentation: "Signature Calcuations for the
+  """Refer to AWS documentation: 'Signature Calcuations for the
   Authorization Header: Transferring Payload in a Single Chunk (AWS
-  Signature Version 4)
+  Signature Version 4)'
   """
   buf = []
 
