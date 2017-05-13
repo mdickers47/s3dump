@@ -25,11 +25,9 @@ Arguments and switches:
   level: an arbitrary int, possibly the dump level (0-9)
 """
 
-import Queue
 import getopt
 import socket
 import sys
-import threading
 import time
 import s3
 
@@ -39,73 +37,9 @@ BLOCK_SIZE = 10 * 1024 # default dump block size is 10k
 S3_CHUNK_SIZE = 1024 * 1024 * 50 # 50MB
 DATE_FMT = '%Y-%m-%d'
 
-class ChunkUploader(threading.Thread):
-  
-  def __init__(self, queue, ringbuf, key_prefix, ratelimit, aws_config):
-    threading.Thread.__init__(self)
-    self.queue = queue
-    self.ringbuf = ringbuf
-    self.key_prefix = key_prefix
-    self.ratelimit = ratelimit
-    self.aws_config = aws_config
-    self.conn = None
-    self.writes = []
 
-  def run(self):
-    chunk = 0
-    read_ptr = 0
-    while True:
-      stop_ptr = self.queue.get()
-      if stop_ptr == -1: break # all done
-
-      print 'uploader: uploading blocks [%d,%d)' % (read_ptr, stop_ptr)
-      buf = []
-      i = start_ptr = read_ptr
-      while i != stop_ptr:
-        buf.append(self.ringbuf[i])
-        i = (i + 1) % len(self.ringbuf)
-      key = '%s:%s' % (self.key_prefix, chunk)
-      data = ''.join(buf)
-
-      tries = 20
-      bucket = None
-      while tries:
-        try:
-          print 'uploader: key is %s (%ld bytes)' % (key, len(data))
-          bucket = s3.Bucket(self.aws_config)
-          r = bucket.put(key, data)
-          body = r.read() # have to read() before starting a new request
-          bucket.close()
-          if r.status >= 300:
-            raise Exception, 'Amazon returned HTTP %d (%s):\n%s' % \
-                  (r.status, r.reason, body)
-          break
-        except Exception, e:
-          if bucket.last_response:
-            sys.stderr.write('Amazon returned HTTP %d (%s)\n' %
-                             (bucket.last_response.status,
-                              bucket.last_response.reason))
-            sys.stderr.write(bucket.last_response.body + '\n')
-          tries -= 1
-          to_sleep = min(600, 2 ** (20 - tries))
-          sys.stderr.write('uploading chunk %d failed: %s\n' % (chunk, e))
-          sys.stderr.write('trying again in %ds (%d remaining).\n' % \
-                             (to_sleep, tries))
-          time.sleep(to_sleep)
-      else:
-        # kill this thread
-        return
-
-      # Release the memory only after the chunk is successfully posted.
-      read_ptr = start_ptr
-      while read_ptr != stop_ptr:
-        self.ringbuf[read_ptr] = None
-        read_ptr = (read_ptr + 1) % len(self.ringbuf)
-
-      chunk += 1
-    print 'uploader: done'
-    return
-
+# For future reference if re-implementing rate limit in s3.py. - mikeyd
+"""
   def send_with_ratelimit(self, data):
     now = time.time()
     sent_last_sec = self.ratelimit
@@ -131,30 +65,7 @@ class ChunkUploader(threading.Thread):
     self.writes.insert(0, (len(data), now))
     while now - self.writes[-1][1] > 1:
       self.writes = self.writes[:-1]
-
-
-def _SortByChunkNumber(a, b):
-  ca = int(a.split(':')[-1])
-  cb = int(b.split(':')[-1])
-  return cmp(ca, cb)
-
-
-def ListChunks(conn, prefix):
-  keys = [ x.key for x in conn.list_bucket().entries ]
-  keys = filter(lambda x: x.startswith(prefix), keys)
-  keys.sort(_SortByChunkNumber)
-  return keys
-
-
-def DeleteChunkedFile(conn, prefix):
-  #print 'delete %s' % prefix
-  #return ### TEST
-  for k in ListChunks(conn, prefix):
-    res = conn.delete(k)
-    res.read() # have to read() before you can start a new request
-    if res.status >= 300:
-      print 'deleting %s, Amazon returned error %d: %s' % \
-            (k, res.status, res.reason)
+"""
 
 
 def RetrieveDumpTree(conn):
@@ -170,9 +81,10 @@ def RetrieveDumpTree(conn):
   #     |-- filesystem /home
   #     +-- ...
   dumps = { }
-  for e in conn.list_bucket().entries:
+  for e in conn.list_bucket():
     try:
-      host, fs, level, date, chunk = e.key.split(':')
+      host, fs, level, datechunk = e.key.split(':')
+      date, chunk = datechunk.split('/')
     except ValueError:
       sys.stderr.write('warning: found weird key named %s\n' % e.key)
       continue
@@ -266,50 +178,17 @@ if __name__ == '__main__':
     print 'Creating bucket %s' % config.bucket_name
     conn = s3.Bucket(config)
     print conn.create_bucket().reason
-
     print conn.put('testkey', s3.S3Object('this is a test')).reason
     print conn.get('testkey').reason
     print conn.delete('testkey').reason
 
   elif '-d' in opts:
-    # dump data to s3
-    # This will be a list of BLOCK_SIZE sized chunks, which will function
-    # as a crude ring buffer.  The uploader thread and reader thread will
-    # both use it at the same time, hopefully without stomping on each
-    # other.  We rely on the promise that operations on python native types,
-    # such as lists, are thread safe.
-    block_buf = [ None ] * int((S3_CHUNK_SIZE / BLOCK_SIZE) * 1.25)
-    chunk_bytes = write_ptr = buffered_bytes = 0
-    chunk_queue = Queue.Queue()
     date = opts.get('-w', time.strftime(DATE_FMT))
-    key_prefix = '%s:%s:%s:%s' % (host, filesystem, level, date)
-    uploader = ChunkUploader(chunk_queue, block_buf, key_prefix,
-                             ratelimit, config)
-    uploader.setDaemon(True)
-    uploader.start()
+    key_prefix = ':'.join([host, filesystem, level, date])
+    md5 = s3.StoreChunkedFile(sys.stdin, s3.Bucket(config), key_prefix,
+                              stdout=sys.stdout, stderr=sys.stderr)
+    sys.stderr.write('md5 of data stored: %s\n' % md5)
     
-    while True:
-      if not uploader.is_alive():
-        sys.exit(1)
-      while block_buf[write_ptr] is not None:
-        #print 'main: waiting for buffer slot %d to clear' % write_ptr
-        time.sleep(0.1)
-      data = sys.stdin.read(BLOCK_SIZE)
-      block_buf[write_ptr] = data
-      buffered_bytes += BLOCK_SIZE
-      write_ptr = (write_ptr + 1) % len(block_buf)
-      if (buffered_bytes >= S3_CHUNK_SIZE or len(data) < BLOCK_SIZE):
-        print 'main: queueing chunk for upload'
-        chunk_queue.put(write_ptr)
-        buffered_bytes = 0
-      if len(data) < BLOCK_SIZE:
-        break
-
-    chunk_queue.put(-1) # magic value meaning 'you're done'
-
-    print 'main: waiting for uploader to finish'
-    uploader.join()
-
   elif '-c' in opts:
     # delete expired dumps
     if not '-y' in opts:
@@ -326,14 +205,14 @@ if __name__ == '__main__':
               print 'deleting dump of %s:%s, level %s, %s' % \
                     (h, fs, level, d)
               if '-y' in opts:
-                DeleteChunkedFile(conn, ':'.join([h, fs, level, d]))
+                s3.DeleteChunkedFile(conn, ':'.join([h, fs, level, d]))
       
   elif '-l' in opts:
     print 'Using bucket %s' % config.bucket_name
     conn = s3.Bucket(config)
     try:
       dumps = RetrieveDumpTree(conn)
-    except s3.ListBucketError, e:
+    except s3.Error, e:
       print 'Error reading from S3: %s' % e
       sys.exit(1)
     total = 0L
@@ -357,17 +236,12 @@ if __name__ == '__main__':
       date = opts['-w']
     else:
       dumps = RetrieveDumpTree(conn)[host][filesystem][level]
-      dates = dumps.keys()
-      dates.sort()
-      date = dates[-1]
-    
-    chunks = ListChunks(conn, ':'.join([host, filesystem, level, date]))
-    
-    for chunk in chunks:
-      sys.stderr.write('Reading chunk %s of %d\n' % (chunk, len(chunks)))
-      response = conn.get(chunk)
-      if response.http_response.status != 200: break
-      sys.stdout.write(response.object.data)
+      date = sorted(dumps.keys())[-1]
+
+    key_prefix = ':'.join([host, filesystem, level, date])
+    md5 = s3.RetrieveChunkedFile(sys.stdout, conn, key_prefix,
+                                 stderr=sys.stderr)
+    sys.stderr.write('md5 of data returned: %s' % md5)
 
   else:
     assert 'Unpossible!' == 0

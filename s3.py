@@ -18,20 +18,40 @@
 import hashlib
 import hmac
 import httplib
+import sys
 import time
 import urllib
-import xml.sax
+import xml.etree.ElementTree as ET
 
 METADATA_PREFIX = 'x-amz-meta-'
 SIG_ALGORITHM = 'AWS4-HMAC-SHA256'
 X_AMZ_DATE_FMT = '%Y%m%dT%H%M%SZ'
+AWS_NS = { 'aws': 'http://s3.amazonaws.com/doc/2006-03-01/' }
 
 class Error(Exception): pass
-
 class AWSConfigError(Error): pass
+class BucketError(Error): pass
+
+
+class AWSHttpError(Error):
+  def __init__(self, http_response):
+    self.message = 'Amazon returned HTTP %d (%s)\n' % \
+                   (http_response.status, http_response.reason)
+    if 'body' in http_response.__dict__:
+      self.message += ('-' * 20 + '\n' + http_response.body + '\n' +
+                       '-' * 20 + '\n')
+    elif 'read' in http_response.__dict__:
+      self.message += ('-' * 20 + '\n' + http_response.read() + '\n' +
+                       '-' * 20 + '\n')
+
+
+class S3Object(object):
+  def __init__(self, data, metadata={}):
+    self.data = data
+    self.metadata = metadata
+
 
 class AWSConfig(object):
-
   def __init__(self, config_file='/etc/s3_keys'):
     self.access_key_id = None
     self.secret_access_key = None
@@ -197,9 +217,6 @@ def auth_header_v4(method, path, headers, config):
   return ''.join(buf)
 
 
-class BucketError(Error): pass
-
-
 class Bucket:
 
   def __init__(self, aws_config):
@@ -276,29 +293,25 @@ class Bucket:
   def put_bucket_acl(self, acl_xml_document, headers=None):
     return self.put_acl('', acl_xml_document, headers=headers)
   
-  def list_bucket(self, options=None, headers=None):
-    self.entries = []
-    if not options: options = {} # this silences a pychecker error
+  def list_bucket(self, key_prefix=None, headers=None):
+    entries = []
+    params = {'list-type': '2'}
+    stringify = lambda p: '%s=%s' % (p, urllib.quote_plus(str(params[p])))
+    if key_prefix: params['prefix'] = key_prefix
+
     while True:
-      path = '/'
-      if options:
-        stringify = lambda p: '%s=%s' % (p, urllib.quote_plus(str(options[p])))
-        path += '?' + '&'.join(map(stringify, options.keys()))
+      path = '/?' + '&'.join(map(stringify, params.keys()))
+      r = self._make_request('GET', path, headers=headers)
+      root = ET.fromstring(r.read())
+      for entry in root.findall('aws:Contents', AWS_NS):
+        entries.append(ListBucketEntry(entry))
+      if root.find('aws:IsTruncated', AWS_NS).text == 'true':
+        ct = root.find('aws:NextContinuationToken', AWS_NS).text
+        params['continuation-token'] = ct
+      else:
+        break
 
-      lst = ListBucketResponse(self._make_request('GET', path,
-                                                  headers=headers))
-
-      self.entries.extend(lst.entries)
-      if not lst.is_truncated: break
-
-      # re-request with the marker set at the last one we got
-      # this time round. This sort of conflicts with the NextMarker
-      # code posted all over the web - but seems to work an dovetails
-      # nicely with
-      # http://docs.amazonwebservices.com/AmazonS3/latest/API/RESTBucketGET.html
-      options['marker'] = self.entries[-1].key
-      
-    return self
+    return entries
 
   def put(self, key, obj, headers=None):
     if not isinstance(obj, S3Object): obj = S3Object(obj)
@@ -340,57 +353,12 @@ class Bucket:
     self.connection = None
 
 
-class S3Object(object):
-  def __init__(self, data, metadata={}):
-    self.data = data
-    self.metadata = metadata
-
-    
-class ListBucketError(Error): pass
-
-
-class ListBucketResponse:
-  def __init__(self, http_response):
-    self.body = http_response.read()
-    if http_response.status < 300:
-      handler = ListBucketHandler()
-      xml.sax.parseString(self.body, handler)
-      self.entries = handler.entries
-      self.common_prefixes = handler.common_prefixes
-      self.name = handler.name
-      self.marker = handler.marker
-      self.prefix = handler.prefix
-      self.is_truncated = handler.is_truncated
-      self.delimiter = handler.delimiter
-      self.max_keys = handler.max_keys
-      self.next_marker = handler.next_marker
-    else:
-      print 'HTTP response body:'
-      print self.body
-      raise ListBucketError('HTTP error %d (%s)' % (http_response.status,
-                                                    http_response.reason))
-      #self.entries = []
-
-
-class Owner:
-  def __init__(self, id='', display_name=''):
-    self.id = id
-    self.display_name = display_name
-
-
-class ListEntry:
-  def __init__(self, key='', last_modified=None, etag='', size=0, storage_class='', owner=None):
-    self.key = key
-    self.last_modified = last_modified
-    self.etag = etag
-    self.size = size
-    self.storage_class = storage_class
-    self.owner = owner
-
-
-class CommonPrefixEntry:
-  def __init__(self, prefix=''):
-    self.prefix = prefix
+class ListBucketEntry(object):
+  def __init__(self, element):
+    assert element.tag.endswith('Contents')
+    for k in ('Key', 'LastModified', 'ETag', 'Size', 'StorageClass'):
+      self.__dict__[k.lower()] = element.find('aws:%s' % k, AWS_NS).text
+    self.size = int(self.size)
 
 
 class GetResponse(S3Object):
@@ -410,76 +378,87 @@ class GetResponse(S3Object):
     return metadata
 
 
-class ListBucketHandler(xml.sax.ContentHandler):
-  def __init__(self):
-    xml.sax.handler.ContentHandler.__init__(self)
-    self.entries = []
-    self.curr_entry = None
-    self.curr_text = ''
-    self.common_prefixes = []
-    self.curr_common_prefix = None
-    self.name = ''
-    self.marker = ''
-    self.prefix = ''
-    self.is_truncated = False
-    self.delimiter = ''
-    self.max_keys = 0
-    self.next_marker = ''
-    self.is_echoed_prefix_set = False
+def StoreChunkedFile(stream, bucket, key_prefix, chunk_size=None,
+                     stdout=None, stderr=None):
 
-  def startElement(self, name, attrs):
-    del attrs # shut up pychecker
-    if name == 'Contents':
-      self.curr_entry = ListEntry()
-    elif name == 'Owner':
-      self.curr_entry.owner = Owner()
-    elif name == 'CommonPrefixes':
-      self.curr_common_prefix = CommonPrefixEntry()
-            
+    if not chunk_size: chunk_size = 50 * 2**20 # 50 MB
+    chunk_num = 0
+    md5 = hashlib.md5()
 
-  def endElement(self, name):
-    if name == 'Contents':
-      self.entries.append(self.curr_entry)
-    elif name == 'CommonPrefixes':
-      self.common_prefixes.append(self.curr_common_prefix)
-    elif name == 'Key':
-      self.curr_entry.key = self.curr_text
-    elif name == 'LastModified':
-      self.curr_entry.last_modified = self.curr_text
-    elif name == 'ETag':
-      self.curr_entry.etag = self.curr_text
-    elif name == 'Size':
-      self.curr_entry.size = int(self.curr_text)
-    elif name == 'ID':
-      self.curr_entry.owner.id = self.curr_text
-    elif name == 'DisplayName':
-      self.curr_entry.owner.display_name = self.curr_text
-    elif name == 'StorageClass':
-      self.curr_entry.storage_class = self.curr_text
-    elif name == 'Name':
-      self.name = self.curr_text
-    elif name == 'Prefix' and self.is_echoed_prefix_set:
-      self.curr_common_prefix.prefix = self.curr_text
-    elif name == 'Prefix':
-      self.prefix = self.curr_text
-      self.is_echoed_prefix_set = True            
-    elif name == 'Marker':
-      self.marker = self.curr_text
-    elif name == 'IsTruncated':
-      # lore on the web suggests 'True;' - but this has not
-      # been observed at the 6 AWS endpoints 2012-01-05
-      self.is_truncated = self.curr_text.lower() == 'true'
-    elif name == 'Delimiter':
-      self.delimiter = self.curr_text
-    elif name == 'MaxKeys':
-      self.max_keys = int(self.curr_text)
-    elif name == 'NextMarker':
-      self.next_marker = self.curr_text
+    while True:
 
-    self.curr_text = ''
+      data = stream.read(chunk_size)
+      md5.update(data)
+      if len(data) == 0: break
+      key = '%s/chunk_%06d' % (key_prefix, chunk_num)
+      tries = 20
 
-  def characters(self, content):
-    self.curr_text += content
+      while True:
+        try:
+          if stdout:
+            stdout.write('uploading %s (%ld bytes)\n' % (key, len(data)))
+          r = bucket.put(key, data)
+          if r.status >= 300: raise AWSHttpError(r)
+          break # this is the exit point if the upload succeeds
+        except Exception, e:
+          if bucket and bucket.last_response:
+            err = AWSHttpError(bucket.last_response)
+            if stderr: stderr.write(err.message + '\n')
+          elif stderr:
+            stderr.write('error: %s\n' % e)
+          tries -= 1
+          if not tries: raise # this is the exit point if we give up
+          to_sleep = min(600, 2 ** (20 - tries))
+          if stderr:
+            stderr.write('trying again in %ds (%d remaining)\n' %
+                         (to_sleep, tries))
+          time.sleep(to_sleep)
+
+      chunk_num += 1
+      if len(data) < chunk_size: break
+
+    stream.close()
+    return md5.hexdigest()
+
+
+def RetrieveChunkedFile(stream, bucket, key_prefix, stdout=None, stderr=None):
+  """This is easier, because we don't have to care what the chunks are
+  named or how big they are.  We just take everything matching
+  key_prefix and concatenate their contents.
+  """
+  if not key_prefix.endswith('/'): key_prefix += '/'
+  chunks = sorted([x.key for x in bucket.list_bucket(key_prefix)])
+  md5 = hashlib.md5()
+  if stdout:
+    stdout.write('%ld chunks to assemble\n' % len(chunks))
+  for k in chunks:
+    if stdout: stdout.write('downloading %s\n' % k)
+    data = bucket.get(k).data
+    md5.update(data)
+    stream.write(data)
+  return md5.hexdigest()
+
+
+def DeleteChunkedFile(bucket, key_prefix, stdout=None, stderr=None):
+  if not key_prefix.endswith('/'): key_prefix += '/'
+  chunks = sorted([x.key for x in bucket.list_bucket(key_prefix)])
+  if stdout: stdout.write('%ld chunks to delete\n' % len(chunks))
+  for k in chunks:
+    if stdout: stdout.write('deleting %s\n' % k)
+    bucket.delete(k)
+
+
+class stream_generator(object):
+  def __init__(self, data):
+    self.data = data
+
+  def read(self, n):
+    block = self.data[:n]
+    self.data = self.data[n:]
+    return block
+
+  def close(self):
+    self.data = ''
 
 
 if __name__ == '__main__':
@@ -508,6 +487,19 @@ if __name__ == '__main__':
       print r.read()
       print '  ----------------------------'
 
+  def _print_checksum(c1, c2):
+    if c1 == c2:
+      print '  md5 checksum matches: %s' % c1
+    else:
+      print '  md5 checksum failed'
+      print '  was: %s' % c1
+      print '  now: %s' % c2
+
+  def _print_time(start_time, byte_count):
+    elapsed_time = time.time() - start_time
+    print '  %.2f seconds / %ld bytes per second' % \
+      (elapsed_time, int(byte_count / elapsed_time))
+
   print 'Listing EC2 regions'
   _print_status(b._make_request(method, path, headers))
 
@@ -523,11 +515,11 @@ if __name__ == '__main__':
   _print_status(b.delete_bucket(test_bucket_name))
 
   print 'Listing contents of %s' % cfg.bucket_name
-  l = b.list_bucket()
-  print '  returned %ld entries' % len(l.entries)
+  lst = b.list_bucket()
+  print '  returned %ld entries' % len(lst)
   for i in (0, 1, 2, 3):
-    if i+1 > len(l.entries): break
-    print '  %s' % l.entries[i].key
+    if i+1 > len(lst): break
+    print '  %s' % lst[i].key
 
   test_key = '0000_s3.py:test/key'
   test_data = 'I\'m Mr. Meeseeks!  Caaaaaaaan Do!'
@@ -547,14 +539,39 @@ if __name__ == '__main__':
   print 'Writing ACL of test key %s' % test_key
   _print_status(b.put_acl(test_key, S3Object(test_acl)))
 
-  #test_data = '0123456789abcde' * 1024 * 1024
   test_data = open('/dev/urandom').read(12 * 2**20)
-  print 'Writing a big fatty key (%ld bytes)' % len(test_data)
+  orig_md5 = hashlib.md5(test_data).hexdigest()
+
+  print 'Writing a big fatty blob (%ld bytes)' % len(test_data)
   start_time = time.time()
   _print_status(b.put(test_key, S3Object(test_data)))
-  elapsed_time = time.time() - start_time
-  print '%.2f seconds / %ld bytes per second' % \
-      (elapsed_time, int(len(test_data) / elapsed_time))
+  _print_time(start_time, len(test_data))
+
+  print 'Reading the big fatty blob'
+  start_time = time.time()
+  r = b.get(test_key)
+  _print_status(r.http_response)
+  _print_time(start_time, len(r.data))
+  new_md5 = hashlib.md5(r.data).hexdigest()
+  _print_checksum(orig_md5, new_md5)
 
   print 'Deleting test key %s' % test_key
   _print_status(b.delete(test_key))
+
+  print 'Writing a big fatty key in chunks'
+  start_time = time.time()
+  new_md5 = StoreChunkedFile(stream_generator(test_data),
+                             b, test_key, chunk_size=2*2**20,
+                             stdout=sys.stdout, stderr=sys.stderr)
+  _print_time(start_time, len(test_data))
+  _print_checksum(orig_md5, new_md5)
+
+  print 'Reading back the big fatty key from chunks'
+  start_time = time.time()
+  new_md5 = RetrieveChunkedFile(open('/dev/null', 'w'), b, test_key,
+                                stdout=sys.stdout, stderr=sys.stderr)
+  _print_time(start_time, len(test_data))
+  _print_checksum(orig_md5, new_md5)
+
+  print 'Deleting chunked key %s' % test_key
+  DeleteChunkedFile(b, test_key, stdout=sys.stdout, stderr=sys.stderr)
