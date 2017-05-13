@@ -59,37 +59,33 @@ class ChunkUploader(threading.Thread):
       if stop_ptr == -1: break # all done
 
       print 'uploader: uploading blocks [%d,%d)' % (read_ptr, stop_ptr)
-      byte_count = 0
+      buf = []
       i = start_ptr = read_ptr
       while i != stop_ptr:
-        byte_count += len(self.ringbuf[i])
+        buf.append(self.ringbuf[i])
         i = (i + 1) % len(self.ringbuf)
       key = '%s:%s' % (self.key_prefix, chunk)
+      data = ''.join(buf)
 
       tries = 20
+      bucket = None
       while tries:
         try:
-          print 'uploader: key is %s (%ld bytes)' % (key, byte_count)
-          self.conn = s3.Bucket(self.aws_config)
-          self.conn.put(key, bytes, open_stream=True)
-          read_ptr = start_ptr
-          while read_ptr != stop_ptr:
-            self.send_with_ratelimit(self.ringbuf[read_ptr])
-            read_ptr = (read_ptr + 1) % len(self.ringbuf)
-          response = self.conn.close_stream()
-          response.read() # have to read() before starting a new request
-          self.conn.close()
-          self.conn = None
-          if response.status >= 300:
-            raise Exception, 'Amazon returned error %d: %s' % \
-                  (response.status, response.reason)
+          print 'uploader: key is %s (%ld bytes)' % (key, len(data))
+          bucket = s3.Bucket(self.aws_config)
+          r = bucket.put(key, data)
+          body = r.read() # have to read() before starting a new request
+          bucket.close()
+          if r.status >= 300:
+            raise Exception, 'Amazon returned HTTP %d (%s):\n%s' % \
+                  (r.status, r.reason, body)
           break
         except Exception, e:
-          try:
-            self.conn.close_stream().read()
-          except:
-            pass
-          self.conn = None
+          if bucket.last_response:
+            sys.stderr.write('Amazon returned HTTP %d (%s)\n' %
+                             (bucket.last_response.status,
+                              bucket.last_response.reason))
+            sys.stderr.write(bucket.last_response.body + '\n')
           tries -= 1
           to_sleep = min(600, 2 ** (20 - tries))
           sys.stderr.write('uploading chunk %d failed: %s\n' % (chunk, e))
@@ -238,7 +234,7 @@ if __name__ == '__main__':
   
   # parse command line
   try:
-    opts, remainder = getopt.getopt(sys.argv[1:], 'drilac:h:w:L:')
+    opts, remainder = getopt.getopt(sys.argv[1:], 'drilac:h:w:L:y')
     opts = dict(opts)
     if '-d' in opts or '-r' in opts:
       filesystem, level = remainder
@@ -316,6 +312,8 @@ if __name__ == '__main__':
 
   elif '-c' in opts:
     # delete expired dumps
+    if not '-y' in opts:
+      print 'NOT DELETING ANYTHING -- add -y switch to delete for real.'
     conn = s3.Bucket(config)
     dumps = RetrieveDumpTree(conn)
     for h in dumps.keys():
@@ -327,7 +325,8 @@ if __name__ == '__main__':
             for d in dates[:0 - opts['-c']]:
               print 'deleting dump of %s:%s, level %s, %s' % \
                     (h, fs, level, d)
-              DeleteChunkedFile(conn, ':'.join([h, fs, level, d]))
+              if '-y' in opts:
+                DeleteChunkedFile(conn, ':'.join([h, fs, level, d]))
       
   elif '-l' in opts:
     print 'Using bucket %s' % config.bucket_name
