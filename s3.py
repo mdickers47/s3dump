@@ -580,14 +580,6 @@ if __name__ == '__main__':
 
   b = Bucket(cfg)
 
-  # Run example API call from the python sample program in the
-  # AWS API documentation.
-  cfg.service = 'ec2'
-  method = 'GET'
-  path = '/?Action=DescribeRegions&Version=2013-10-15'
-  headers = {'Host': 'ec2.amazonaws.com'}
-  signed_headers, cstr = canonical_string_v4(method, path, headers)
-
   def _print_status(r):
     print '  return status %d (%s)' % (r.status, r.reason)
     if r.status >= 300:
@@ -609,6 +601,10 @@ if __name__ == '__main__':
       (elapsed_time, int(byte_count / elapsed_time))
 
   print 'Listing EC2 regions'
+  cfg.service = 'ec2'
+  method = 'GET'
+  path = '/?Action=DescribeRegions&Version=2013-10-15'
+  headers = {'Host': 'ec2.amazonaws.com'}
   _print_status(b._make_request(method, path, headers))
 
   cfg.service = 's3'
