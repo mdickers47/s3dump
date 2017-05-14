@@ -33,6 +33,7 @@ The rest is Copyright 2006-2017 Mikey Dickerson.  Use is permitted
 under the same terms as the above notice.
 """
 
+import base64
 import hashlib
 import hmac
 import httplib
@@ -142,10 +143,11 @@ def canonical_string_v4(method, path, headers):
 
   headers_to_sign = set()
   headers_to_sign.add('host') # required
-  # headers_to_sign.add('x-amz-content-sha256') # also required
 
+  # these are discovered on the fly, usually.
+  must_sign_if_present = ('content-type', 'content-md5', 'date')
   for h in headers.keys():
-    if h == 'content-type' or h == 'date' or h.startswith('x-amz-'):
+    if h in must_sign_if_present or h.startswith('x-amz-'):
       headers_to_sign.add(h)
 
   for h in sorted(list(headers_to_sign)):
@@ -179,7 +181,6 @@ def string_to_sign_v4(canonical_req, amz_time, datestr, region, service):
   buf = []
   buf.append(SIG_ALGORITHM)
   buf.append('\n')
-  #buf.append(time.strftime(X_AMZ_DATE_FMT, time.gmtime()))
   buf.append(amz_time)
   buf.append('\n')
   buf.append(datestr)
@@ -239,6 +240,9 @@ class Bucket:
     self.connection = None
     self.debug_log = None
     self.last_response = None
+    self.multipart_upload_id = None
+    self.multipart_upload_key = None
+    self.multipart_upload_parts = None
 
   def _debug(self, msg):
     if self.debug_log: self.debug_log.write(msg, '\n')
@@ -255,19 +259,20 @@ class Bucket:
     # signing algorithm requires it.
     if headers:
       h = {}
-      for k, v in headers.items():
-        h[k.lower()] = str(v)
+      for k, v in headers.items(): h[k.lower()] = str(v)
       headers = h
     else:
       headers = {}
 
     if s3obj:
+      """Modify headers dict with metadata about the object."""
       payload = s3obj.data
+      for k, v in s3obj.metadata.items(): headers[METADATA_PREFIX + k] = v
+      headers['content-length'] = str(len(payload))
+      d = hashlib.md5(payload).digest()
+      headers['content-md5'] = base64.encodestring(d).strip()
     else:
       payload = ''
-
-    if method != 'PUT' and s3obj:
-      raise BucketError('non-PUT request cannot take an object')
 
     if not path.startswith('/'): path = '/' + path
 
@@ -291,6 +296,11 @@ class Bucket:
     self.connection.request(method, path, payload, headers)
     ret = self.connection.getresponse()
     self._debug('Response: %s (%s)' % (ret.status, ret.reason))
+    if ret.status >= 300:
+      ret.body = ret.read()
+      e = AWSHttpError(ret)
+      self._debug(e.message)
+      raise e
 
     return ret
 
@@ -328,21 +338,10 @@ class Bucket:
 
     return entries
 
-  def put(self, key, obj, headers=None):
+  def put(self, key, obj, headers={}):
     if not isinstance(obj, S3Object): obj = S3Object(obj)
-    if not headers: headers = {}
-    for k, v in obj.metadata.items(): headers[METADATA_PREFIX + k] = v
-    try:
-      r = self._make_request('PUT', urllib.quote(key),
-                             headers=headers, s3obj=obj)
-      return r
-    except Exception:
-      # failures happen here a lot, so try to capture the HTTP response so
-      # the upstream exception handler has a chance to look at it.
-      if self.connection:
-        self.last_response = self.connection.getresponse()
-        self.last_response.body = self.last_response.read()
-      raise
+    return self._make_request('PUT', urllib.quote(key),
+                              headers=headers, s3obj=obj)
 
   def get(self, key, headers=None):
     r = self._make_request('GET', urllib.quote(key), headers=headers)
@@ -362,6 +361,77 @@ class Bucket:
                            '/%s?acl' % urllib.quote(key),
                            headers=headers)
     return GetResponse(r)
+
+  def begin_multipart(self, key, headers=None):
+    if (self.multipart_upload_key or self.multipart_upload_id or
+        self.multipart_upload_parts):
+      raise BucketError('multipart upload already inititated.')
+
+    r = self._make_request('POST', '%s?uploads' % urllib.quote(key),
+                           headers=headers)
+    r.body = r.read()
+    root = ET.fromstring(r.body)
+    if not root.tag.endswith('InitiateMultipartUploadResult'):
+      raise BucketError('AWS responded with unexpected element %s' % root.tag)
+    b = root.find('aws:Bucket', AWS_NS).text
+    if b != self.config.bucket_name:
+      raise BucketError('AWS responded with unexpected bucket name %s' % b)
+    k = root.find('aws:Key', AWS_NS).text
+    if k != key:
+      raise BucketError('AWS responded with unexpected key %s' % k)
+
+    self.multipart_upload_key = key
+    self.multipart_upload_id = root.find('aws:UploadId', AWS_NS).text
+    self.multipart_upload_parts = []
+    return r
+
+  def put_multipart(self, obj, headers={}):
+    if None in (self.multipart_upload_key, self.multipart_upload_id,
+                self.multipart_upload_parts):
+      raise BucketError('multipart upload must be initialized first.')
+    if not isinstance(obj, S3Object): obj = S3Object(obj)
+    path = '%s?partNumber=%d&uploadId=%s' % \
+           (urllib.quote(self.multipart_upload_key),
+            len(self.multipart_upload_parts) + 1, self.multipart_upload_id)
+
+    r = self._make_request('PUT', path, s3obj=obj, headers=headers)
+    self.multipart_upload_parts.append(r.getheader('ETag'))
+    return r
+
+  def complete_multipart(self, headers={}):
+    body = []
+    body.append('<CompleteMultipartUpload>')
+    for i, p in enumerate(self.multipart_upload_parts):
+      body.append('<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>' \
+                  % (i + 1, p))
+    body.append('</CompleteMultipartUpload>')
+    body = '\n'.join(body)
+    path = '/%s?uploadId=%s' % (urllib.quote(self.multipart_upload_key),
+                                urllib.quote(self.multipart_upload_id))
+    r = self._make_request('POST', path, s3obj=S3Object(body),
+                           headers=headers)
+    r.body = r.read()
+    root = ET.fromstring(r.body)
+    if root.tag.endswith('CompleteMultipartUploadResult'):
+      self.multipart_upload_key = None
+      self.multipart_upload_id = None
+      self.multipart_upload_parts = None
+    elif root.tag.endswith('Error'):
+      raise BucketError(root.find('aws:Message', AWS_NS).text)
+    else:
+      raise BucketError('AWS responded with unexpected element %s' % root.tag)
+
+    return r
+
+  def abort_multipart(self, headers={}):
+    path = '/%s?uploadId=%s' % (urllib.quote(self.multipart_upload_key),
+                                urllib.quote(self.multipart_upload_id))
+    r = self._make_request('DELETE', path, headers=headers)
+    if r.status == 200:
+      self.multipart_upload_key = None
+      self.multipart_upload_id = None
+      self.multipart_upload_parts = None
+    return r
 
   def close(self):
     self.connection.close()
@@ -554,9 +624,37 @@ if __name__ == '__main__':
   print 'Writing ACL of test key %s' % test_key
   _print_status(b.put_acl(test_key, S3Object(test_acl)))
 
+  print 'Writing a multipart upload'
+  orig_md5 = hashlib.md5()
+  start_time = time.time()
+  _print_status(b.begin_multipart(test_key))
+  for i in range(4):
+    # Documentation says 5MB is the smallest allowed part size.
+    test_data = open('/dev/urandom').read(5 * 2**20)
+    orig_md5.update(test_data)
+    _print_status(b.put_multipart(test_data))
+  test_data = open('/dev/urandom').read(6 * 2**20 + 11)
+  orig_md5.update(test_data)
+  _print_status(b.put_multipart(test_data))
+  _print_status(b.complete_multipart())
+  _print_time(start_time, 6 * 2**20 + 11)
+
+  print 'Reading back multipart-assembled blob'
+  start_time = time.time()
+  r = b.get(test_key)
+  _print_status(r.http_response)
+  _print_time(start_time, len(r.data))
+  new_md5 = hashlib.md5(r.data).hexdigest()
+  _print_checksum(orig_md5.hexdigest(), new_md5)
+
+  print 'Starting a new multipart upload'
+  _print_status(b.begin_multipart(test_key))
+  _print_status(b.put_multipart(test_data))
+  print 'Aborting multipart upload'
+  _print_status(b.abort_multipart())
+
   test_data = open('/dev/urandom').read(12 * 2**20)
   orig_md5 = hashlib.md5(test_data).hexdigest()
-
   print 'Writing a big fatty blob (%ld bytes)' % len(test_data)
   start_time = time.time()
   _print_status(b.put(test_key, S3Object(test_data)))
