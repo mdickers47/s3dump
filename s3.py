@@ -46,6 +46,7 @@ METADATA_PREFIX = 'x-amz-meta-'
 SIG_ALGORITHM = 'AWS4-HMAC-SHA256'
 X_AMZ_DATE_FMT = '%Y%m%dT%H%M%SZ'
 AWS_NS = { 'aws': 'http://s3.amazonaws.com/doc/2006-03-01/' }
+STORAGE_STD, STORAGE_IA, STORAGE_RR = 0, 1, 2
 
 class Error(Exception): pass
 class AWSConfigError(Error): pass
@@ -243,6 +244,7 @@ class Bucket:
     self.multipart_upload_id = None
     self.multipart_upload_key = None
     self.multipart_upload_parts = None
+    self.persistent_headers = {}
 
   def _debug(self, msg):
     if self.debug_log: self.debug_log.write(msg, '\n')
@@ -259,10 +261,14 @@ class Bucket:
     # signing algorithm requires it.
     if headers:
       h = {}
-      for k, v in headers.items(): h[k.lower()] = str(v)
+      for k, v in headers.items(): h[k.lower()] = str(v).strip()
       headers = h
     else:
       headers = {}
+
+    for k, v in self.persistent_headers.items():
+      if k.lower() not in headers:
+        headers[k.lower()] = str(v).strip()
 
     if s3obj:
       """Modify headers dict with metadata about the object."""
@@ -303,6 +309,23 @@ class Bucket:
       raise e
 
     return ret
+
+  def set_header(self, header, val):
+    self.persistent_headers[header] = val
+
+  def delete_header(self, header):
+    if header in self.persistent_headers:
+      del self.persistent_headers[header]
+
+  def set_storage_class(self, storage_class):
+    if storage_class == STORAGE_STD:
+      self.delete_header('x-amz-storage-class')
+    elif storage_class == STORAGE_IA:
+      self.set_header('x-amz-storage-class', 'STANDARD_IA')
+    elif storage_class == STORAGE_RR:
+      self.set_header('x-amz-storage-class', 'REDUCED_REDUNDANCY')
+    else:
+      raise BucketError('invalid setting for storage class')
 
   def create_bucket(self, bucket_name=None, headers=None):
     return self._make_request('PUT', bucket_name or self.config.bucket_name,
@@ -633,11 +656,11 @@ if __name__ == '__main__':
     test_data = open('/dev/urandom').read(5 * 2**20)
     orig_md5.update(test_data)
     _print_status(b.put_multipart(test_data))
-  test_data = open('/dev/urandom').read(6 * 2**20 + 11)
+  test_data = open('/dev/urandom').read(1 * 2**20 + 11)
   orig_md5.update(test_data)
   _print_status(b.put_multipart(test_data))
   _print_status(b.complete_multipart())
-  _print_time(start_time, 6 * 2**20 + 11)
+  _print_time(start_time, 21 * 2**20 + 11)
 
   print 'Reading back multipart-assembled blob'
   start_time = time.time()
@@ -655,10 +678,14 @@ if __name__ == '__main__':
 
   test_data = open('/dev/urandom').read(12 * 2**20)
   orig_md5 = hashlib.md5(test_data).hexdigest()
+  print 'Setting storage class to Infrequent Access'
+  b.set_storage_class(STORAGE_IA)
   print 'Writing a big fatty blob (%ld bytes)' % len(test_data)
   start_time = time.time()
   _print_status(b.put(test_key, S3Object(test_data)))
   _print_time(start_time, len(test_data))
+  print 'Setting storage class to Standard'
+  b.set_storage_class(STORAGE_STD)
 
   print 'Reading the big fatty blob'
   start_time = time.time()
