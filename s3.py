@@ -48,6 +48,12 @@ X_AMZ_DATE_FMT = '%Y%m%dT%H%M%SZ'
 AWS_NS = { 'aws': 'http://s3.amazonaws.com/doc/2006-03-01/' }
 STORAGE_STD, STORAGE_IA, STORAGE_RR = 0, 1, 2
 
+# This is the size beyond which put_streaming() will automatically
+# switch to multipart upload.  The maximum number of parts S3 will
+# take is 10,000.  Therefore the largest object you can store via
+# put_streaming() is 10,000 * MIN_PART_SIZE.
+MIN_PART_SIZE = 20 * 2**20 # actual S3 minimum is 5MB as of May 2017
+
 class Error(Exception): pass
 class AWSConfigError(Error): pass
 class BucketError(Error): pass
@@ -310,6 +316,10 @@ class Bucket:
 
     return ret
 
+  ##### Any HTTP header (e.g. controlling AWS metadata) can be supplied
+  ##### on any request.  But for convenience the calling script can set
+  ##### it once on the Bucket() and leave it for all subsequent calls.
+
   def set_header(self, header, val):
     self.persistent_headers[header] = val
 
@@ -326,6 +336,8 @@ class Bucket:
       self.set_header('x-amz-storage-class', 'REDUCED_REDUNDANCY')
     else:
       raise BucketError('invalid setting for storage class')
+
+  ##### Bucket operations: create, delete, list, set ACL
 
   def create_bucket(self, bucket_name=None, headers=None):
     return self._make_request('PUT', bucket_name or self.config.bucket_name,
@@ -361,6 +373,8 @@ class Bucket:
 
     return entries
 
+  ##### Simple put/get/delete, best for small in-memory objects.
+
   def put(self, key, obj, headers={}):
     if not isinstance(obj, S3Object): obj = S3Object(obj)
     return self._make_request('PUT', urllib.quote(key),
@@ -373,6 +387,32 @@ class Bucket:
   def delete(self, key, headers=None):
     return self._make_request('DELETE', urllib.quote(key), headers=headers)
 
+  ##### Streaming put, best when you don't know the size of the object.
+
+  def put_streaming(self, key, stream, headers={}, stdout=None, stderr=None):
+    """Read object data from stream.  If stream is big enough, do a
+    multipart upload (avoids ever materializing the entire blob in
+    RAM).  Otherwise do a simple PUT.
+    """
+    data_block = stream.read(MIN_PART_SIZE)
+    if len(data_block) < MIN_PART_SIZE:
+      r = self.put(key, data_block, headers=headers)
+    else:
+      self.begin_multipart(key, headers=headers)
+      TryReallyHard(lambda: self.put_multipart(data_block, headers=headers),
+                    'uploading %ld byte part' % len(data_block),
+                    stdout=stdout, stderr=stderr)
+      while len(data_block) == MIN_PART_SIZE:
+        data_block = stream.read(MIN_PART_SIZE)
+        TryReallyHard(lambda: self.put_multipart(data_block, headers=headers),
+                      'uploading %ld byte part' % len(data_block),
+                      stdout=stdout, stderr=stderr)
+      r = self.complete_multipart(headers=headers)
+    stream.close()
+    return r
+
+  ##### ACL put/get
+
   def put_acl(self, key, acl_xml_document, headers=None):
     return self._make_request('PUT',
                               '%s?acl' % urllib.quote(key),
@@ -384,6 +424,9 @@ class Bucket:
                            '/%s?acl' % urllib.quote(key),
                            headers=headers)
     return GetResponse(r)
+
+  ##### Multipart put, use when you have a big object divided into
+  ##### pieces and you know in advance.
 
   def begin_multipart(self, key, headers=None):
     if (self.multipart_upload_key or self.multipart_upload_id or
@@ -450,7 +493,7 @@ class Bucket:
     path = '/%s?uploadId=%s' % (urllib.quote(self.multipart_upload_key),
                                 urllib.quote(self.multipart_upload_id))
     r = self._make_request('DELETE', path, headers=headers)
-    if r.status == 200:
+    if r.status < 300:
       self.multipart_upload_key = None
       self.multipart_upload_id = None
       self.multipart_upload_parts = None
@@ -486,42 +529,42 @@ class GetResponse(S3Object):
     return metadata
 
 
-def StoreChunkedFile(stream, bucket, key_prefix, chunk_size=None,
-                     stdout=None, stderr=None):
+def TryReallyHard(what, desc=None, stdout=None, stderr=None):
+  """Try up to 20 times to complete what() without catching an
+  exception.  Comments on how it's going are written to stdout and
+  stderr if provided.  If we fail 20 times, the last Exception is
+  raised.  Otherwise we return the return value of what().
+  """
+  tries = 20
+  ret = None
+  while True:
+    try:
+      if desc and stdout: stdout.write(desc + '\n')
+      ret = what()
+      return ret # this is the exit of 'while True' if we succeed
+    except Exception, e:
+      if stderr: stderr.write('failed: %s\n' % e)
+      tries -= 1
+      if not tries: raise # this is the exit if we give up
+      to_sleep = min(600, 2 ** (20 - tries))
+      if stderr:
+        stderr.write('trying again in %ds (%d remaining)\n' % (to_sleep, tries))
+      time.sleep(to_sleep)
 
-    if not chunk_size: chunk_size = 50 * 2**20 # 50 MB
+
+def StoreChunkedFile(stream, bucket, key_prefix, chunk_size=MIN_PART_SIZE,
+                     stdout=None, stderr=None):
     chunk_num = 0
     md5 = hashlib.md5()
 
     while True:
-
       data = stream.read(chunk_size)
       md5.update(data)
       if len(data) == 0: break
       key = '%s/chunk_%06d' % (key_prefix, chunk_num)
-      tries = 20
-
-      while True:
-        try:
-          if stdout:
-            stdout.write('uploading %s (%ld bytes)\n' % (key, len(data)))
-          r = bucket.put(key, data)
-          if r.status >= 300: raise AWSHttpError(r)
-          break # this is the exit point if the upload succeeds
-        except Exception, e:
-          if bucket and bucket.last_response:
-            err = AWSHttpError(bucket.last_response)
-            if stderr: stderr.write(err.message + '\n')
-          elif stderr:
-            stderr.write('error: %s\n' % e)
-          tries -= 1
-          if not tries: raise # this is the exit point if we give up
-          to_sleep = min(600, 2 ** (20 - tries))
-          if stderr:
-            stderr.write('trying again in %ds (%d remaining)\n' %
-                         (to_sleep, tries))
-          time.sleep(to_sleep)
-
+      TryReallyHard(lambda: bucket.put(key, data),
+                    'uploading %s (%ld bytes)' % (key, len(data)),
+                    stdout=stdout, stderr=stderr)
       chunk_num += 1
       if len(data) < chunk_size: break
 
@@ -690,6 +733,12 @@ if __name__ == '__main__':
   _print_time(start_time, len(r.data))
   new_md5 = hashlib.md5(r.data).hexdigest()
   _print_checksum(orig_md5, new_md5)
+
+  print 'Writing a big fatty blob via put_streaming'
+  start_time = time.time()
+  _print_status(b.put_streaming(test_key, stream_generator(test_data),
+                                stdout=sys.stdout, stderr=sys.stderr))
+  _print_time(start_time, len(test_data))
 
   print 'Deleting test key %s' % test_key
   _print_status(b.delete(test_key))
