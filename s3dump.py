@@ -208,9 +208,9 @@ if __name__ == '__main__':
     else:
       # find the last dump
       key_prefix = '%s:%s:%s:' % (host, filesystem, level)
-      key = b.list_bucket(key_prefix)[-1]
+      key = b.list_bucket(key_prefix)[-1].key
 
-    b.get_streaming(key, sys.stdout, stdout=sys.stdout, stderr=sys.stderr)
+    b.get_streaming(key, sys.stdout, stdout=sys.stderr, stderr=sys.stderr)
 
   else:
     usage('unrecognized command word: %s' % cmd)

@@ -408,7 +408,7 @@ class Bucket:
 
   ##### Simple put/get/delete, best for small in-memory objects.
 
-  def put(self, key, obj, headers={}):
+  def put(self, key, obj, headers=None):
     if not isinstance(obj, S3Object): obj = S3Object(obj)
     return self._make_request('PUT', urllib.quote(key),
                               headers=headers, s3obj=obj)
@@ -419,7 +419,9 @@ class Bucket:
   def delete(self, key, headers=None):
     return self._make_request('DELETE', urllib.quote(key), headers=headers)
 
-  ##### Streaming put, best when you don't know the size of the object.
+  ##### Streaming put/get, good when you don't know the size of the
+  ##### object, or want to avoid ever materializing the whole thing in
+  ##### RAM.
 
   def put_streaming(self, key, stream, headers={}, stdout=None, stderr=None):
     """Read object data from stream.  If stream is big enough, do a
