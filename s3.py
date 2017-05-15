@@ -75,6 +75,12 @@ class S3Object(object):
   def __init__(self, data, metadata={}):
     self.data = data
     self.metadata = metadata
+    self.status = None # these are copied from HTTPResponse when the
+    self.reason = None # object was retrieved from S3
+    self.headers = {}
+
+  def getheader(self, h):
+    return self.headers[h.lower()]
 
 
 class AWSConfig(object):
@@ -221,11 +227,9 @@ def auth_header_v4(method, path, headers, config):
   buf.append(SIG_ALGORITHM)
   buf.append(' Credential=')
   buf.append(credential)
-
   buf.append(', SignedHeaders=')
   signed_headers, c_string = canonical_string_v4(method, path, headers)
   buf.append(signed_headers)
-
   buf.append(', Signature=')
   signing_key = signing_key_v4(config.secret_access_key,
                                datestr, config.region, config.service)
@@ -251,6 +255,7 @@ class Bucket:
     self.multipart_upload_key = None
     self.multipart_upload_parts = None
     self.persistent_headers = {}
+    self.ratelimit = None
 
   def _debug(self, msg):
     if self.debug_log: self.debug_log.write(msg, '\n')
@@ -280,13 +285,12 @@ class Bucket:
       """Modify headers dict with metadata about the object."""
       payload = s3obj.data
       for k, v in s3obj.metadata.items(): headers[METADATA_PREFIX + k] = v
-      headers['content-length'] = str(len(payload))
-      d = hashlib.md5(payload).digest()
-      headers['content-md5'] = base64.encodestring(d).strip()
     else:
       payload = ''
 
-    if not path.startswith('/'): path = '/' + path
+    headers['content-length'] = str(len(payload))
+    d = hashlib.md5(payload).digest()
+    headers['content-md5'] = base64.encodestring(d).strip()
 
     if not 'x-amz-date' in headers:
       headers['x-amz-date'] = time.strftime(X_AMZ_DATE_FMT, time.gmtime())
@@ -301,20 +305,49 @@ class Bucket:
     headers['authorization'] = auth_header_v4(method, path, headers,
                                               self.config)
 
+    if not path.startswith('/'): path = '/' + path
+
     self._debug('Request: %s %s' % (method, path))
     self._debug('Opening connection: %s' % headers['host'])
     if self.connection: self.connection.close()
     self.connection = httplib.HTTPSConnection(headers['host'])
-    self.connection.request(method, path, payload, headers)
-    ret = self.connection.getresponse()
-    self._debug('Response: %s (%s)' % (ret.status, ret.reason))
-    if ret.status >= 300:
-      ret.body = ret.read()
-      e = AWSHttpError(ret)
+
+    # if we were not trying to do the ratelimiting, this could be simply:
+    #self.connection.request(method, path, payload, headers)
+    #return self.connection.getresponse()
+
+    self.connection.putrequest(method, path, skip_host=True)
+    for k, v in headers.items(): self.connection.putheader(k, v)
+    self.connection.endheaders()
+    WriteWithRatelimit(self.connection, payload, self.ratelimit)
+    res = self.connection.getresponse()
+
+    # now interpret the response.  If it is HTTP 2xx, save the headers
+    # and metadata and response body, and return an S3Object.  If it is
+    # >= HTTP 300, throw exception.
+
+    self._debug('Response: %s (%s)' % (res.status, res.reason))
+    if res.status >= 300:
+      res.body = res.read()
+      e = AWSHttpError(res)
       self._debug(e.message)
       raise e
 
-    return ret
+    headers = {}
+    for k, v in res.getheaders():
+      self._debug('Header %s: %s' % (k, v))
+      headers[k.lower()] = v.strip()
+
+    metadata = {}
+    for k in filter(lambda x: x.lower().startswith(METADATA_PREFIX),
+                    headers.keys()):
+      metadata[k[len(METADATA_PREFIX):]] = headers[k]
+      del headers[k]
+    obj = S3Object(ReadWithRatelimit(res, self.ratelimit), metadata)
+    obj.status = res.status
+    obj.reason = res.reason
+    obj.headers = headers
+    return obj
 
   ##### Any HTTP header (e.g. controlling AWS metadata) can be supplied
   ##### on any request.  But for convenience the calling script can set
@@ -362,7 +395,7 @@ class Bucket:
     while True:
       path = '/?' + '&'.join(map(stringify, params.keys()))
       r = self._make_request('GET', path, headers=headers)
-      root = ET.fromstring(r.read())
+      root = ET.fromstring(r.data)
       for entry in root.findall('aws:Contents', AWS_NS):
         entries.append(ListBucketEntry(entry))
       if root.find('aws:IsTruncated', AWS_NS).text == 'true':
@@ -381,8 +414,7 @@ class Bucket:
                               headers=headers, s3obj=obj)
 
   def get(self, key, headers=None):
-    r = self._make_request('GET', urllib.quote(key), headers=headers)
-    return GetResponse(r)
+    return self._make_request('GET', urllib.quote(key), headers=headers)
   
   def delete(self, key, headers=None):
     return self._make_request('DELETE', urllib.quote(key), headers=headers)
@@ -411,6 +443,19 @@ class Bucket:
     stream.close()
     return r
 
+  def get_streaming(self, key, stream, headers={}, stdout=None, stderr=None):
+    ptr = 0
+    while True:
+      r = 'bytes=%d-%d' % (ptr, ptr + MIN_PART_SIZE - 1)
+      headers['Range'] = r
+      if stdout: stdout.write('retrieving %s\n' % r)
+      r = self.get(key, headers=headers)
+      stream.write(r.data)
+      ptr += MIN_PART_SIZE
+      if len(r.data) < MIN_PART_SIZE: break
+    stream.close()
+    return r
+
   ##### ACL put/get
 
   def put_acl(self, key, acl_xml_document, headers=None):
@@ -420,10 +465,9 @@ class Bucket:
                               s3obj=acl_xml_document)
   
   def get_acl(self, key, headers=None):
-    r = self._make_request('GET',
-                           '/%s?acl' % urllib.quote(key),
-                           headers=headers)
-    return GetResponse(r)
+    return  self._make_request('GET',
+                               '/%s?acl' % urllib.quote(key),
+                               headers=headers)
 
   ##### Multipart put, use when you have a big object divided into
   ##### pieces and you know in advance.
@@ -435,8 +479,7 @@ class Bucket:
 
     r = self._make_request('POST', '%s?uploads' % urllib.quote(key),
                            headers=headers)
-    r.body = r.read()
-    root = ET.fromstring(r.body)
+    root = ET.fromstring(r.data)
     if not root.tag.endswith('InitiateMultipartUploadResult'):
       raise BucketError('AWS responded with unexpected element %s' % root.tag)
     b = root.find('aws:Bucket', AWS_NS).text
@@ -476,8 +519,7 @@ class Bucket:
                                 urllib.quote(self.multipart_upload_id))
     r = self._make_request('POST', path, s3obj=S3Object(body),
                            headers=headers)
-    r.body = r.read()
-    root = ET.fromstring(r.body)
+    root = ET.fromstring(r.data)
     if root.tag.endswith('CompleteMultipartUploadResult'):
       self.multipart_upload_key = None
       self.multipart_upload_id = None
@@ -493,10 +535,9 @@ class Bucket:
     path = '/%s?uploadId=%s' % (urllib.quote(self.multipart_upload_key),
                                 urllib.quote(self.multipart_upload_id))
     r = self._make_request('DELETE', path, headers=headers)
-    if r.status < 300:
-      self.multipart_upload_key = None
-      self.multipart_upload_id = None
-      self.multipart_upload_parts = None
+    self.multipart_upload_key = None
+    self.multipart_upload_id = None
+    self.multipart_upload_parts = None
     return r
 
   def close(self):
@@ -527,6 +568,38 @@ class GetResponse(S3Object):
         metadata[hkey[len(METADATA_PREFIX):]] = headers[hkey]
         del headers[hkey]
     return metadata
+
+
+def ReadWithRatelimit(httpresponse, bytes_per_sec):
+  """Call read() up to 10 times per second, with naps in between that
+  are adjusted to try to target bytes_per_second per second.
+  """
+  if not bytes_per_sec: return httpresponse.read()
+  segment_size = bytes_per_sec / 4
+  if segment_size < 1: raise Error('impossibly low rate limit')
+  segment = ' ' * segment_size
+  data = ''
+  last_read = time.time()
+  while len(segment) == segment_size:
+    segment = httpresponse.read(segment_size)
+    data += segment
+    to_sleep = max(0, 0.25 - (time.time() - last_read))
+    last_read = time.time()
+    time.sleep(to_sleep)
+  return data
+
+
+def WriteWithRatelimit(httpconn, data, bytes_per_sec):
+  if not bytes_per_sec: return httpconn.send(data)
+  segment_size = bytes_per_sec / 4
+  if segment_size < 1: raise Error('impossibly low rate limit')
+  last_read = time.time()
+  while data:
+    httpconn.send(data[:segment_size])
+    data = data[segment_size:]
+    to_sleep = max(0, 0.25 - (time.time() - last_read))
+    last_read = time.time()
+    time.sleep(to_sleep)
 
 
 def TryReallyHard(what, desc=None, stdout=None, stderr=None):
@@ -612,6 +685,18 @@ class stream_generator(object):
     self.data = ''
 
 
+class stream_consumer(object):
+  def __init__(self):
+    self.byte_count = 0
+    self.md5 = hashlib.md5()
+
+  def write(self, data):
+    self.byte_count += len(data)
+    self.md5.update(data)
+
+  def close(self): pass
+
+
 if __name__ == '__main__':
 
   print 'Running S3 integration tests'
@@ -627,7 +712,7 @@ if __name__ == '__main__':
     print '  return status %d (%s)' % (r.status, r.reason)
     if r.status >= 300:
       print '  ----- body of response -----'
-      print r.read()
+      print r.data
       print '  ----------------------------'
 
   def _print_checksum(c1, c2):
@@ -675,12 +760,12 @@ if __name__ == '__main__':
 
   print 'Reading test key %s' % test_key
   r = b.get(test_key)
-  _print_status(r.http_response)
+  _print_status(r)
   assert r.data == test_data
 
   print 'Reading ACL of test key %s' % test_key
   r = b.get_acl(test_key)
-  _print_status(r.http_response)
+  _print_status(r)
   test_acl = r.data
 
   print 'Writing ACL of test key %s' % test_key
@@ -704,7 +789,7 @@ if __name__ == '__main__':
   print 'Reading back multipart-assembled blob'
   start_time = time.time()
   r = b.get(test_key)
-  _print_status(r.http_response)
+  _print_status(r)
   _print_time(start_time, len(r.data))
   new_md5 = hashlib.md5(r.data).hexdigest()
   _print_checksum(orig_md5.hexdigest(), new_md5)
@@ -715,30 +800,40 @@ if __name__ == '__main__':
   print 'Aborting multipart upload'
   _print_status(b.abort_multipart())
 
+  print 'Setting rate limit to 200kB/s'
+  b.ratelimit = 200 * 1024
+
   test_data = open('/dev/urandom').read(12 * 2**20)
   orig_md5 = hashlib.md5(test_data).hexdigest()
-  print 'Setting storage class to Infrequent Access'
-  b.set_storage_class(STORAGE_IA)
   print 'Writing a big fatty blob (%ld bytes)' % len(test_data)
   start_time = time.time()
   _print_status(b.put(test_key, S3Object(test_data)))
   _print_time(start_time, len(test_data))
-  print 'Setting storage class to Standard'
-  b.set_storage_class(STORAGE_STD)
 
   print 'Reading the big fatty blob'
   start_time = time.time()
   r = b.get(test_key)
-  _print_status(r.http_response)
+  _print_status(r)
   _print_time(start_time, len(r.data))
   new_md5 = hashlib.md5(r.data).hexdigest()
   _print_checksum(orig_md5, new_md5)
+
+  print 'Removing rate limit'
+  b.ratelimit = None
 
   print 'Writing a big fatty blob via put_streaming'
   start_time = time.time()
   _print_status(b.put_streaming(test_key, stream_generator(test_data),
                                 stdout=sys.stdout, stderr=sys.stderr))
   _print_time(start_time, len(test_data))
+
+  print 'Reading the big fatty blob with get_streaming'
+  start_time = time.time()
+  sink = stream_consumer()
+  _print_status(b.get_streaming(test_key, sink, stdout=sys.stdout,
+                                stderr=sys.stderr))
+  _print_time(start_time, sink.byte_count)
+  _print_checksum(orig_md5, sink.md5.hexdigest())
 
   print 'Deleting test key %s' % test_key
   _print_status(b.delete(test_key))
