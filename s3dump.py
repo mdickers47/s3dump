@@ -35,6 +35,7 @@ clean   - delete all but the most recent n dumps at each fs and level
 
 options that apply to any command:
 -L <arg>: ratelimit S3 socket to <arg>{k,m,g} bytes per second
+-f <arg>: read S3 configuration from <arg> rather than /etc/s3_keys
 """
 
 import getopt
@@ -150,7 +151,7 @@ if __name__ == '__main__':
 
   # parse command line
   try:
-    opts, remainder = getopt.getopt(sys.argv[1:], 'ac:h:w:L:y')
+    opts, remainder = getopt.getopt(sys.argv[1:], 'ayc:h:w:L:f:')
     opts = dict(opts)
 
     if not remainder: raise ValueError('must supply a command word')
@@ -164,6 +165,7 @@ if __name__ == '__main__':
       raise ValueError('date cannot contain : or /')
     clean_level = int(opts.get('-c', 2))
     ratelimit = int(DehumanizeBytes(opts.get('-L', '0')))
+    config_file = opts.get('-f', CONFIG_FILE)
 
     if cmd in ('dump', 'restore'):
       if '-k' in opts:
@@ -181,9 +183,9 @@ if __name__ == '__main__':
 
   # load config
   try:
-    config = s3.AWSConfig(config_file=CONFIG_FILE)
+    config = s3.AWSConfig(config_file)
   except s3.AWSConfigError, e:
-    sys.stderr.write('Error in config file %s: %s' % (CONFIG_FILE, e))
+    sys.stderr.write('Error in config file %s: %s' % (config_file, e))
     sys.exit(1)
 
   b = s3.Bucket(config)
