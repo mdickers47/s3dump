@@ -96,13 +96,13 @@ def PrintDumpTable(bucket):
              for (h, f, l, d), s in dumpsizes.items() ]
     rows.sort()
     rows.insert(0, ('-- host', 'filesystem', 'level', 'date', 'size'))
-    if othersizes: print 'Dump-style objects:'
+    if othersizes: print '-- Dump-style objects:'
     PrintTable(rows, sys.stdout)
   if othersizes:
     rows = [ tuple([k, HumanizeBytes(v)]) for k, v in othersizes.items() ]
     rows.sort()
     rows.insert(0, ('-- key', 'size'))
-    if dumpsizes: print '\nOther objects:'
+    if dumpsizes: print '\n-- Other objects:'
     PrintTable(rows, sys.stdout)
 
   return total_bytes
