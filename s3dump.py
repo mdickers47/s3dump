@@ -13,22 +13,28 @@ command must be one of:
 
 dump    - write data to S3
 restore - retrieve data from S3
-          Must supply either 'fs level' args, or '-k' option.
-          fs level - arbitrary strings, maybe filesystem and level
+
+          May use '-k' to provide a name ('key') for the S3 object.
           -k <arg>: literal name of key in S3 bucket
+
+          Otherwise, must provide 'fs level' on the command line, and a key
+          will be constructed using current host name, fs, level, and date.
+          fs level - arbitrary strings, intended to be filesystem and level
           -h <arg>: override default hostname with <arg>
-          -w <arg>: override default date, use YYYY-MM-DD
-          -L <arg>: ratelimit S3 socket to <arg>{k,m,g} bytes/sec.
+          -w <arg>: override default date, use format YYYY-MM-DD
 
 list    - print list of dumps available in S3
-          -a: list for all all hosts
+          -a: list for all hosts
           -h <arg>: list for host <arg>
 
 init    - create and test bucket
 
-clean   - delete all but the last -c dumps of each fs and level
-          -a: clean all dumps, not just mine
+clean   - delete all but the most recent n dumps at each fs and level
+          -a: clean all dumps, not just ones for this host
           -c <arg>: keep the last <arg> dumps of each fs and level
+
+options that apply to any command:
+-L <arg>: ratelimit S3 socket to <arg>{k,m,g} bytes per second
 """
 
 import getopt
@@ -67,21 +73,53 @@ def RetrieveDumpTree(conn):
   return dumps
 
 
-def PrintDumpTree(t):
-  filesystems = t.keys()
-  filesystems.sort()
-  total = 0L
-  for f in filesystems:
-    print '  ' + f
-    levels = t[f].keys()
-    levels.sort()
-    for l in levels:
-      dates = t[f][l].keys()
-      dates.sort()
-      for d in dates:
-        print '    Level %s %s: %8s' % (l, d, HumanizeBytes(t[f][l][d]))
-        total += t[f][l][d]
-  return total
+def PrintDumpTable(bucket):
+  dumpsizes = {}
+  othersizes = {}
+  total_bytes = 0
+  for e in bucket.list_bucket():
+    try:
+      host, fs, level, date = e.key.split(':')
+      t = (host, fs, level, date)
+      dumpsizes.setdefault(t, 0)
+      dumpsizes[t] += e.size
+      total_bytes += e.size
+    except ValueError:
+      othersizes.setdefault(e.key, 0)
+      othersizes[e.key] += e.size
+      total_bytes += e.size
+
+  # flatten the dicts of (host,fs,level,date) => size to a 2d array
+  if dumpsizes:
+    rows = [ tuple([h, f, l, d, HumanizeBytes(s)])
+             for (h, f, l, d), s in dumpsizes.items() ]
+    rows.sort()
+    rows.insert(0, ('-- host', 'filesystem', 'level', 'date', 'size'))
+    if othersizes: print 'Dump-style objects:'
+    PrintTable(rows, sys.stdout)
+  if othersizes:
+    rows = [ tuple([k, HumanizeBytes(v)]) for k, v in othersizes.items() ]
+    rows.sort()
+    rows.insert(0, ('-- key', 'size'))
+    if dumpsizes: print '\nOther objects:'
+    PrintTable(rows, sys.stdout)
+
+  return total_bytes
+
+
+def PrintTable(array, stream):
+  """given a 2d array (list of tuples), figure out column widths and
+  printf an ascii-art table."""
+  col_widths = [0] * len(array[0])
+  for row in array:
+    for i, val in enumerate(row):
+      if len(str(val)) > col_widths[i]: col_widths[i] = len(str(val))
+  fmt_str = ' '.join(['%-' + str(x) + 's' for x in col_widths]) + '\n'
+  hrule = '-' * ( sum(col_widths) + len(col_widths) - 1) + '\n'
+  stream.write(fmt_str % array[0])
+  stream.write(hrule)
+  for row in array[1:]: stream.write(fmt_str % row)
+  stream.write(hrule)
 
 
 def HumanizeBytes(b):
@@ -181,25 +219,9 @@ if __name__ == '__main__':
                 s3.DeleteChunkedFile(conn, ':'.join([h, fs, level, d]))
       
   elif cmd == 'list':
-    print 'Using bucket %s' % config.bucket_name
-    try:
-      dumps = RetrieveDumpTree(b)
-    except s3.Error, e:
-      print 'Error reading from S3: %s' % e
-      sys.exit(1)
-    total = 0L
-    if host in dumps:
-      print 'Dumps for this host (%s):' % host
-      total += PrintDumpTree(dumps[host])
-    if '-a' in opts:
-      hosts = filter(lambda x: x != host, dumps.keys())
-      hosts.sort()
-      for h in hosts:
-        print
-        print 'Dumps for host %s:' % h
-        total += PrintDumpTree(dumps[h])
-    print
-    print 'Total data stored: %s ($%.2f/month)' % \
+    print '-- Listing contents of %s' % config.bucket_name
+    total = PrintDumpTable(b)
+    print '-- Total data stored: %s ($%.2f/month)' % \
       (HumanizeBytes(total), total / (2**30) * 0.023)
 
   elif cmd == 'restore' or cmd == 'retrieve':
