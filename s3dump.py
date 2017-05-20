@@ -151,7 +151,7 @@ if __name__ == '__main__':
 
   # parse command line
   try:
-    opts, remainder = getopt.getopt(sys.argv[1:], 'ayc:h:w:L:f:')
+    opts, remainder = getopt.getopt(sys.argv[1:], 'ayc:h:w:L:f:k:')
     opts = dict(opts)
 
     if not remainder: raise ValueError('must supply a command word')
@@ -201,8 +201,12 @@ if __name__ == '__main__':
     print b.delete('testkey').reason
 
   elif cmd == 'dump':
-    b.put_streaming(key_prefix, sys.stdin,
-                    stdout=sys.stdout, stderr=sys.stderr)
+    try:
+      b.put_streaming(key_prefix, sys.stdin,
+                      stdout=sys.stdout, stderr=sys.stderr)
+    except s3.Error, e:
+      sys.stderr.write(e.message + '\n')
+      sys.exit(1)
     
   elif cmd == 'clean':
     if not '-y' in opts:
@@ -234,7 +238,11 @@ if __name__ == '__main__':
       key_prefix = '%s:%s:%s:' % (host, filesystem, level)
       key = b.list_bucket(key_prefix)[-1].key
 
-    b.get_streaming(key, sys.stdout, stdout=sys.stderr, stderr=sys.stderr)
+    try:
+      b.get_streaming(key, sys.stdout, stdout=sys.stderr, stderr=sys.stderr)
+    except s3.Error, e:
+      sys.stderr.write(e.message + '\n')
+      sys.exit(1)
 
   else:
     usage('unrecognized command word: %s' % cmd)
