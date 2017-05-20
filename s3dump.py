@@ -11,8 +11,9 @@ Usage: s3dump.py [opts] command
 
 command must be one of:
 
-dump    - write data to S3
-restore - retrieve data from S3
+dump    - write an object to S3
+restore - retrieve an object from S3
+delete  - delete an object in S3
 
           May use '-k' to provide a name ('key') for the S3 object.
           -k <arg>: literal name of key in S3 bucket
@@ -23,9 +24,7 @@ restore - retrieve data from S3
           -h <arg>: override default hostname with <arg>
           -w <arg>: override default date, use format YYYY-MM-DD
 
-list    - print list of dumps available in S3
-          -a: list for all hosts
-          -h <arg>: list for host <arg>
+list    - print list of dumps/objects available in S3
 
 init    - create and test bucket
 
@@ -34,6 +33,7 @@ clean   - delete all but the most recent n dumps at each fs and level
           -c <arg>: keep the last <arg> dumps of each fs and level
 
 options that apply to any command:
+
 -L <arg>: ratelimit S3 socket to <arg>{k,m,g} bytes per second
 -f <arg>: read S3 configuration from <arg> rather than /etc/s3_keys
 """
@@ -102,7 +102,7 @@ def PrintDumpTable(bucket):
     rows = [ tuple([k, HumanizeBytes(v)]) for k, v in othersizes.items() ]
     rows.sort()
     rows.insert(0, ('-- key', 'size'))
-    if dumpsizes: print '\n-- Other objects:'
+    if dumpsizes: print '-- Other objects:'
     PrintTable(rows, sys.stdout)
 
   return total_bytes
@@ -167,7 +167,7 @@ if __name__ == '__main__':
     ratelimit = int(DehumanizeBytes(opts.get('-L', '0')))
     config_file = opts.get('-f', CONFIG_FILE)
 
-    if cmd in ('dump', 'restore'):
+    if cmd in ('dump', 'restore', 'delete'):
       if '-k' in opts:
         key_prefix = opts['-k']
       elif len(remainder) == 2:
@@ -200,6 +200,17 @@ if __name__ == '__main__':
     print b.get('testkey').reason
     print b.delete('testkey').reason
 
+  elif cmd == 'delete':
+    try:
+      if b.list_bucket(key_prefix + '/'):
+        s3.DeleteChunkedFile(b, key_prefix,
+                             stdout=sys.stdout, stderr=sys.stderr)
+      else:
+        b.delete(key_prefix)
+    except s3.Error, e:
+      sys.stderr.write(e.message + '\n')
+      sys.exit(1)
+
   elif cmd == 'dump':
     try:
       b.put_streaming(key_prefix, sys.stdin,
@@ -222,7 +233,7 @@ if __name__ == '__main__':
               print 'deleting dump of %s:%s, level %s, %s' % \
                     (h, fs, level, d)
               if '-y' in opts:
-                s3.DeleteChunkedFile(conn, ':'.join([h, fs, level, d]))
+                s3.DeleteChunkedFile(b, ':'.join([h, fs, level, d]))
       
   elif cmd == 'list':
     print '-- Listing contents of %s' % config.bucket_name
