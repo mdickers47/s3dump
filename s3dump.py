@@ -32,6 +32,9 @@ clean   - delete all but the most recent n dumps at each fs and level
           -a: clean all dumps, not just ones for this host
           -c <arg>: keep the last <arg> dumps of each fs and level
 
+getacl  - print given key's ACL XML document to stdout
+putacl  - read ACL XML document from stdin, apply to given key
+
 options that apply to any command:
 
 -L <arg>: ratelimit S3 socket to <arg>{k,m,g} bytes per second
@@ -167,7 +170,7 @@ if __name__ == '__main__':
     ratelimit = int(DehumanizeBytes(opts.get('-L', '0')))
     config_file = opts.get('-f', CONFIG_FILE)
 
-    if cmd in ('dump', 'restore', 'delete'):
+    if cmd in ('dump', 'restore', 'delete', 'putacl', 'getacl'):
       if '-k' in opts:
         key_prefix = opts['-k']
       elif len(remainder) == 2:
@@ -254,6 +257,14 @@ if __name__ == '__main__':
     except s3.Error, e:
       sys.stderr.write(e.message + '\n')
       sys.exit(1)
+
+  elif cmd == 'getacl':
+    print b.get_acl(key_prefix).data
+
+  elif cmd == 'putacl':
+    #acl = sys.stdin.read()
+    r = b.put_acl(key_prefix, s3.S3Object(sys.stdin.read()))
+    print '%s (%s)' % (r.status, r.reason)
 
   else:
     usage('unrecognized command word: %s' % cmd)
