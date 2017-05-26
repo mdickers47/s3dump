@@ -46,7 +46,9 @@ METADATA_PREFIX = 'x-amz-meta-'
 SIG_ALGORITHM = 'AWS4-HMAC-SHA256'
 X_AMZ_DATE_FMT = '%Y%m%dT%H%M%SZ'
 AWS_NS = { 'aws': 'http://s3.amazonaws.com/doc/2006-03-01/' }
-STORAGE_STD, STORAGE_IA, STORAGE_RR = 0, 1, 2
+STORAGE_CLASS_HEADER = 'x-amz-storage-class'
+STORAGE_STD, STORAGE_IA, STORAGE_RR = ('STANDARD', 'STANDARD_IA',
+                                       'REDUCED_REDUNDANCY')
 
 # This is the size beyond which put_streaming() will automatically
 # switch to multipart upload.  The maximum number of parts S3 will
@@ -60,13 +62,16 @@ class BucketError(Error): pass
 
 
 class AWSHttpError(Error):
-  def __init__(self, http_response):
-    self.message = 'Amazon returned HTTP %d (%s)\n' % \
-                   (http_response.status, http_response.reason)
-    if 'body' in http_response.__dict__:
+  def __init__(self, http_response, exception=None):
+    self.message = ''
+    if exception: self.message = str(exception) + '\n'
+    if http_response and 'status' in http_response.__dict__:
+      self.message += 'Amazon returned HTTP %d (%s)\n' % \
+                      (http_response.status, http_response.reason)
+    if http_response and 'body' in http_response.__dict__:
       self.message += ('-' * 20 + '\n' + http_response.body + '\n' +
                        '-' * 20 + '\n')
-    elif 'read' in http_response.__dict__:
+    elif http_response and 'read' in http_response.__dict__:
       self.message += ('-' * 20 + '\n' + http_response.read() + '\n' +
                        '-' * 20 + '\n')
 
@@ -256,6 +261,7 @@ class Bucket:
     self.multipart_upload_parts = None
     self.persistent_headers = {}
     self.ratelimit = None
+    self.storage_class = None
 
   def _debug(self, msg):
     if self.debug_log: self.debug_log.write(msg, '\n')
@@ -306,21 +312,35 @@ class Bucket:
                                               self.config)
 
     if not path.startswith('/'): path = '/' + path
+    res = None
 
-    self._debug('Request: %s %s' % (method, path))
-    self._debug('Opening connection: %s' % headers['host'])
-    if self.connection: self.connection.close()
-    self.connection = httplib.HTTPSConnection(headers['host'])
+    try:
+      self._debug('Request: %s %s' % (method, path))
+      self._debug('Opening connection: %s' % headers['host'])
+      if self.connection: self.connection.close()
+      self.connection = httplib.HTTPSConnection(headers['host'])
 
-    # if we were not trying to do the ratelimiting, this could be simply:
-    #self.connection.request(method, path, payload, headers)
-    #return self.connection.getresponse()
+      # if we were not trying to do the ratelimiting, this could be simply:
+      #self.connection.request(method, path, payload, headers)
+      #return self.connection.getresponse()
 
-    self.connection.putrequest(method, path, skip_host=True)
-    for k, v in headers.items(): self.connection.putheader(k, v)
-    self.connection.endheaders()
-    WriteWithRatelimit(self.connection, payload, self.ratelimit)
-    res = self.connection.getresponse()
+      self.connection.putrequest(method, path, skip_host=True)
+      for k, v in headers.items(): self.connection.putheader(k, v)
+      self.connection.endheaders()
+      WriteWithRatelimit(self.connection, payload, self.ratelimit)
+      res = self.connection.getresponse()
+
+    except Exception, e:
+      # try really hard to capture everything AWS sent in response, even
+      # if we were killed mid-request by e.g. TCP reset, because it usually
+      # explains the error which can otherwise be impossible to guess.
+      if not res:
+        try:
+          res = self.connection.getresponse()
+          res.body = res.read()
+        except:
+          pass
+      raise AWSHttpError(res, exception=e)
 
     # now interpret the response.  If it is HTTP 2xx, save the headers
     # and metadata and response body, and return an S3Object.  If it is
@@ -360,15 +380,22 @@ class Bucket:
     if header in self.persistent_headers:
       del self.persistent_headers[header]
 
+  ##### This is annoying, but storage_class can't just be set as a
+  ##### persistent header and left alone, because AWS fails the
+  ##### request if the header is present in certain places including
+  ##### multipart upload.
+
   def set_storage_class(self, storage_class):
     if storage_class == STORAGE_STD:
-      self.delete_header('x-amz-storage-class')
-    elif storage_class == STORAGE_IA:
-      self.set_header('x-amz-storage-class', 'STANDARD_IA')
-    elif storage_class == STORAGE_RR:
-      self.set_header('x-amz-storage-class', 'REDUCED_REDUNDANCY')
+      self.storage_class = None
+    elif storage_class in (STORAGE_IA, STORAGE_RR):
+      self.storage_class = storage_class
     else:
       raise BucketError('invalid setting for storage class')
+
+  def _add_storage_class_header(self, headers):
+    if self.storage_class:
+      headers[STORAGE_CLASS_HEADER] = self.storage_class
 
   ##### Bucket operations: create, delete, list, set ACL
 
@@ -410,6 +437,8 @@ class Bucket:
 
   def put(self, key, obj, headers=None):
     if not isinstance(obj, S3Object): obj = S3Object(obj)
+    if not headers: headers = {}
+    self._add_storage_class_header(headers)
     return self._make_request('PUT', urllib.quote(key),
                               headers=headers, s3obj=obj)
 
@@ -423,7 +452,7 @@ class Bucket:
   ##### object, or want to avoid ever materializing the whole thing in
   ##### RAM.
 
-  def put_streaming(self, key, stream, headers={}, stdout=None, stderr=None):
+  def put_streaming(self, key, stream, headers=None, stdout=None, stderr=None):
     """Read object data from stream.  If stream is big enough, do a
     multipart upload (avoids ever materializing the entire blob in
     RAM).  Otherwise do a simple PUT.
@@ -432,20 +461,23 @@ class Bucket:
     if len(data_block) < MIN_PART_SIZE:
       r = self.put(key, data_block, headers=headers)
     else:
+      block_count = 1
       self.begin_multipart(key, headers=headers)
       TryReallyHard(lambda: self.put_multipart(data_block, headers=headers),
-                    'uploading %ld byte part' % len(data_block),
+                    'uploading %ld byte part (1)' % len(data_block),
                     stdout=stdout, stderr=stderr)
       while len(data_block) == MIN_PART_SIZE:
         data_block = stream.read(MIN_PART_SIZE)
+        block_count += 1
+        msg = 'uploading %ld byte part (%d)' % (len(data_block), block_count)
         TryReallyHard(lambda: self.put_multipart(data_block, headers=headers),
-                      'uploading %ld byte part' % len(data_block),
-                      stdout=stdout, stderr=stderr)
+                      msg, stdout=stdout, stderr=stderr)
       r = self.complete_multipart(headers=headers)
     stream.close()
     return r
 
-  def get_streaming(self, key, stream, headers={}, stdout=None, stderr=None):
+  def get_streaming(self, key, stream, headers=None, stdout=None, stderr=None):
+    if not headers: headers = {}
     ptr = 0
     while True:
       r = 'bytes=%d-%d' % (ptr, ptr + MIN_PART_SIZE - 1)
@@ -478,6 +510,9 @@ class Bucket:
     if (self.multipart_upload_key or self.multipart_upload_id or
         self.multipart_upload_parts):
       raise BucketError('multipart upload already inititated.')
+
+    if not headers: headers = {}
+    self._add_storage_class_header(headers)
 
     r = self._make_request('POST', '%s?uploads' % urllib.quote(key),
                            headers=headers)
@@ -618,7 +653,7 @@ def TryReallyHard(what, desc=None, stdout=None, stderr=None):
       ret = what()
       return ret # this is the exit of 'while True' if we succeed
     except Exception, e:
-      if stderr: stderr.write('failed: %s\n' % e)
+      if stderr: stderr.write('failed: %s\n' % e.message)
       tries -= 1
       if not tries: raise # this is the exit if we give up
       to_sleep = min(600, 2 ** (20 - tries))
@@ -836,6 +871,13 @@ if __name__ == '__main__':
                                 stderr=sys.stderr))
   _print_time(start_time, sink.byte_count)
   _print_checksum(orig_md5, sink.md5.hexdigest())
+
+  print 'Writing a big fatty blob with storage class STORAGE_IA'
+  b.set_storage_class(STORAGE_IA)
+  start_time = time.time()
+  _print_status(b.put_streaming(test_key, stream_generator(test_data),
+                                stdout=sys.stdout, stderr=sys.stderr))
+  _print_time(start_time, len(test_data))
 
   print 'Deleting test key %s' % test_key
   _print_status(b.delete(test_key))

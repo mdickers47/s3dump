@@ -36,6 +36,7 @@ options that apply to any command:
 
 -L <arg>: ratelimit S3 socket to <arg>{k,m,g} bytes per second
 -f <arg>: read S3 configuration from <arg> rather than /etc/s3_keys
+-i: use S3 'infrequent access' storage class
 """
 
 import getopt
@@ -151,7 +152,7 @@ if __name__ == '__main__':
 
   # parse command line
   try:
-    opts, remainder = getopt.getopt(sys.argv[1:], 'ayc:h:w:L:f:k:')
+    opts, remainder = getopt.getopt(sys.argv[1:], 'aiyc:h:w:L:f:k:')
     opts = dict(opts)
 
     if not remainder: raise ValueError('must supply a command word')
@@ -190,6 +191,7 @@ if __name__ == '__main__':
 
   b = s3.Bucket(config)
   b.ratelimit = ratelimit
+  if '-i' in opts: b.set_storage_class(s3.STORAGE_IA)
 
   if cmd == 'init' or cmd == 'initialize':
     # initialize dumps bucket
