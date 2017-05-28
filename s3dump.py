@@ -43,12 +43,12 @@ options that apply to any command:
 """
 
 import getopt
+import os
+import s3
 import socket
 import sys
 import time
-import s3
 
-CONFIG_FILE = '/etc/s3_keys'
 DATE_FMT = '%Y-%m-%d'
 
 
@@ -169,7 +169,7 @@ if __name__ == '__main__':
       raise ValueError('date cannot contain : or /')
     clean_level = int(opts.get('-c', 2))
     ratelimit = int(DehumanizeBytes(opts.get('-L', '0')))
-    config_file = opts.get('-f', CONFIG_FILE)
+    config_file = opts.get('-f', os.path.expanduser('~/.s3keys'))
 
     if cmd in ('dump', 'restore', 'delete', 'putacl', 'getacl'):
       if '-k' in opts:
