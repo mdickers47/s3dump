@@ -608,7 +608,7 @@ class GetResponse(S3Object):
 
 
 def ReadWithRatelimit(httpresponse, bytes_per_sec):
-  """Call read() up to 10 times per second, with naps in between that
+  """Call read() up to 4 times per second, with naps in between that
   are adjusted to try to target bytes_per_second per second.
   """
   if not bytes_per_sec: return httpresponse.read()

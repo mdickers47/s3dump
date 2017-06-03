@@ -45,12 +45,15 @@ options that apply to any command:
 import getopt
 import os
 import s3
+import signal
 import socket
 import sys
 import time
 
 DATE_FMT = '%Y-%m-%d'
 
+# Need this in a global so that signal handlers can change the ratelimit.
+global bucket
 
 def RetrieveDumpTree(conn):
   # The map of stored dumps is complicated:
@@ -144,6 +147,25 @@ def DehumanizeBytes(s):
     return long(s)
 
 
+def ChangeRatelimit(signum, _):
+  # we don't use the frame parameter; naming it _ makes pychecker ignore it.
+  global bucket
+  if not bucket.ratelimit:
+    new_ratelimit = 256 * 1024 # 256 kB/s
+  elif signum == signal.SIGUSR1:
+    new_ratelimit = bucket.ratelimit / 2
+  else:
+    assert signum == signal.SIGUSR2
+    new_ratelimit = bucket.ratelimit * 2
+  if new_ratelimit > 10 * (2**20) or new_ratelimit < 1024:
+    # out of the range 1kB - 10MB per second
+    sys.stderr.write('s3dump: removing ratelimit\n')
+    bucket.ratelimit = None
+  else:
+    sys.stderr.write('s3dump: new ratelimit %ld bytes/sec\n' % new_ratelimit)
+    bucket.ratelimit = new_ratelimit
+
+
 def usage(msg):
   sys.stderr.write('error: %s\n' % msg)
   sys.stderr.write(__doc__)
@@ -192,34 +214,38 @@ if __name__ == '__main__':
     sys.stderr.write('Error in config file %s: %s' % (config_file, e))
     sys.exit(1)
 
-  b = s3.Bucket(config)
-  b.ratelimit = ratelimit
-  if '-i' in opts: b.set_storage_class(s3.STORAGE_IA)
+  global bucket
+  bucket = s3.Bucket(config)
+  bucket.ratelimit = ratelimit
+  if '-i' in opts: bucket.set_storage_class(s3.STORAGE_IA)
+
+  signal.signal(signal.SIGUSR1, ChangeRatelimit)
+  signal.signal(signal.SIGUSR2, ChangeRatelimit)
 
   if cmd == 'init' or cmd == 'initialize':
     # initialize dumps bucket
     print 'Creating bucket %s' % config.bucket_name
-    print b.create_bucket().reason
+    print bucket.create_bucket().reason
     print 'Testing ability to write, read, and delete:'
-    print b.put('testkey', s3.S3Object('this is a test')).reason
-    print b.get('testkey').reason
-    print b.delete('testkey').reason
+    print bucket.put('testkey', s3.S3Object('this is a test')).reason
+    print bucket.get('testkey').reason
+    print bucket.delete('testkey').reason
 
   elif cmd == 'delete':
     try:
-      if b.list_bucket(key_prefix + '/'):
-        s3.DeleteChunkedFile(b, key_prefix,
+      if bucket.list_bucket(key_prefix + '/'):
+        s3.DeleteChunkedFile(bucket, key_prefix,
                              stdout=sys.stdout, stderr=sys.stderr)
       else:
-        b.delete(key_prefix)
+        bucket.delete(key_prefix)
     except s3.Error, e:
       sys.stderr.write(e.message + '\n')
       sys.exit(1)
 
   elif cmd == 'dump':
     try:
-      b.put_streaming(key_prefix, sys.stdin,
-                      stdout=sys.stdout, stderr=sys.stderr)
+      bucket.put_streaming(key_prefix, sys.stdin,
+                           stdout=sys.stdout, stderr=sys.stderr)
     except s3.Error, e:
       sys.stderr.write(e.message + '\n')
       sys.exit(1)
@@ -227,7 +253,7 @@ if __name__ == '__main__':
   elif cmd == 'clean':
     if not '-y' in opts:
       print 'NOT DELETING ANYTHING -- add -y switch to delete for real.'
-    dumps = RetrieveDumpTree(b)
+    dumps = RetrieveDumpTree(bucket)
     for h in dumps.keys():
       if host == h or '-a' in opts:
         for fs in dumps[h]:
@@ -238,11 +264,11 @@ if __name__ == '__main__':
               print 'deleting dump of %s:%s, level %s, %s' % \
                     (h, fs, level, d)
               if '-y' in opts:
-                s3.DeleteChunkedFile(b, ':'.join([h, fs, level, d]))
+                s3.DeleteChunkedFile(bucket, ':'.join([h, fs, level, d]))
       
   elif cmd == 'list':
     print '-- Listing contents of %s' % config.bucket_name
-    total = PrintDumpTable(b)
+    total = PrintDumpTable(bucket)
     print '-- Total data stored: %s ($%.2f/month)' % \
       (HumanizeBytes(total), total / (2**30) * 0.023)
 
@@ -252,20 +278,21 @@ if __name__ == '__main__':
     else:
       # find the last dump
       key_prefix = '%s:%s:%s:' % (host, filesystem, level)
-      key = b.list_bucket(key_prefix)[-1].key
+      key = bucket.list_bucket(key_prefix)[-1].key
 
     try:
-      b.get_streaming(key, sys.stdout, stdout=sys.stderr, stderr=sys.stderr)
+      bucket.get_streaming(key, sys.stdout,
+                           stdout=sys.stderr, stderr=sys.stderr)
     except s3.Error, e:
       sys.stderr.write(e.message + '\n')
       sys.exit(1)
 
   elif cmd == 'getacl':
-    print b.get_acl(key_prefix).data
+    print bucket.get_acl(key_prefix).data
 
   elif cmd == 'putacl':
     #acl = sys.stdin.read()
-    r = b.put_acl(key_prefix, s3.S3Object(sys.stdin.read()))
+    r = bucket.put_acl(key_prefix, s3.S3Object(sys.stdin.read()))
     print '%s (%s)' % (r.status, r.reason)
 
   else:
