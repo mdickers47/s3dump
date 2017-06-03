@@ -268,7 +268,11 @@ if __name__ == '__main__':
       
   elif cmd == 'list':
     print '-- Listing contents of %s' % config.bucket_name
-    total = PrintDumpTable(bucket)
+    try:
+      total = PrintDumpTable(bucket)
+    except s3.AWSHttpError, e:
+      sys.stderr.write(e.message + '\n')
+      sys.exit(1)
     print '-- Total data stored: %s ($%.2f/month)' % \
       (HumanizeBytes(total), total / (2**30) * 0.023)
 
