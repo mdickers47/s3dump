@@ -37,6 +37,7 @@ putacl  - read ACL XML document from stdin, apply to given key
 
 options that apply to any command:
 
+-q: suppress status messages, only report errors
 -L <arg>: ratelimit S3 socket to <arg>{k,m,g} bytes per second
 -f <arg>: read S3 configuration from <arg> rather than /etc/s3_keys
 -i: use S3 'infrequent access' storage class
@@ -177,7 +178,7 @@ if __name__ == '__main__':
 
   # parse command line
   try:
-    opts, remainder = getopt.getopt(sys.argv[1:], 'aiyc:h:w:L:f:k:')
+    opts, remainder = getopt.getopt(sys.argv[1:], 'aiyqc:h:w:L:f:k:')
     opts = dict(opts)
 
     if not remainder: raise ValueError('must supply a command word')
@@ -218,6 +219,8 @@ if __name__ == '__main__':
   bucket = s3.Bucket(config)
   bucket.ratelimit = ratelimit
   if '-i' in opts: bucket.set_storage_class(s3.STORAGE_IA)
+  bucket_stdout = sys.stdout
+  if '-q' in opts: bucket_stdout = None
 
   signal.signal(signal.SIGUSR1, ChangeRatelimit)
   signal.signal(signal.SIGUSR2, ChangeRatelimit)
@@ -235,7 +238,7 @@ if __name__ == '__main__':
     try:
       if bucket.list_bucket(key_prefix + '/'):
         s3.DeleteChunkedFile(bucket, key_prefix,
-                             stdout=sys.stdout, stderr=sys.stderr)
+                             stdout=bucket_stdout, stderr=sys.stderr)
       else:
         bucket.delete(key_prefix)
     except s3.Error, e:
@@ -245,7 +248,7 @@ if __name__ == '__main__':
   elif cmd == 'dump':
     try:
       bucket.put_streaming(key_prefix, sys.stdin,
-                           stdout=sys.stdout, stderr=sys.stderr)
+                           stdout=bucket_stdout, stderr=sys.stderr)
     except s3.Error, e:
       sys.stderr.write(e.message + '\n')
       sys.exit(1)
@@ -261,8 +264,9 @@ if __name__ == '__main__':
             dates = dumps[h][fs][level].keys()
             dates.sort()
             for d in dates[:0 - opts['-c']]:
-              print 'deleting dump of %s:%s, level %s, %s' % \
-                    (h, fs, level, d)
+              if not '-q' in opts:
+                print 'deleting dump of %s:%s, level %s, %s' % \
+                      (h, fs, level, d)
               if '-y' in opts:
                 s3.DeleteChunkedFile(bucket, ':'.join([h, fs, level, d]))
       
@@ -284,9 +288,13 @@ if __name__ == '__main__':
       key_prefix = '%s:%s:%s:' % (host, filesystem, level)
       key = bucket.list_bucket(key_prefix)[-1].key
 
+    # in this case we have the bucket send status messages to stderr,
+    # because stdout is where the data goes.
+    if not '-q' in opts: bucket_stdout = sys.stderr
+
     try:
       bucket.get_streaming(key, sys.stdout,
-                           stdout=sys.stderr, stderr=sys.stderr)
+                           stdout=bucket_stdout, stderr=sys.stderr)
     except s3.Error, e:
       sys.stderr.write(e.message + '\n')
       sys.exit(1)
