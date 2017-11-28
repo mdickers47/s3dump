@@ -11,26 +11,22 @@ Usage: s3dump.py [opts] command
 
 command must be one of:
 
-dump    - write an object to S3
-restore - retrieve an object from S3
-delete  - delete an object in S3
+dump FS LEVEL    - write an object to S3
+restore FS LEVEL - retrieve an object from S3
+delete FS LEVEL  - delete an object in S3
 
-          May use '-k' to provide a name ('key') for the S3 object.
-          -k <arg>: literal name of key in S3 bucket
-
-          Otherwise, must provide 'fs level' on the command line, and a key
-          will be constructed using current host name, fs, level, and date.
-          fs level - arbitrary strings, intended to be filesystem and level
-          -h <arg>: override default hostname with <arg>
-          -w <arg>: override default date, use format YYYY-MM-DD
+          -k <arg>: Optional literal name of key in S3 bucket.  Otherwise,
+                    must provide FS and LEVEL on the command line, and a
+                    key will be created using hostname, fs, level, date.
+          -h <arg>: Override default hostname with <arg>
+          -w <arg>: Override default date, use format YYYY-MM-DD
 
 list    - print list of dumps/objects available in S3
 
 init    - create and test bucket
 
-clean   - delete all but the most recent n dumps at each fs and level
+clean N - delete all but the most recent N dumps at each fs and level
           -a: clean all dumps, not just ones for this host
-          -c <arg>: keep the last <arg> dumps of each fs and level
 
 getacl  - print given key's ACL XML document to stdout
 putacl  - read ACL XML document from stdin, apply to given key
@@ -178,7 +174,7 @@ if __name__ == '__main__':
 
   # parse command line
   try:
-    opts, remainder = getopt.getopt(sys.argv[1:], 'aiyqc:h:w:L:f:k:')
+    opts, remainder = getopt.getopt(sys.argv[1:], 'aiyqh:w:L:f:k:')
     opts = dict(opts)
 
     if not remainder: raise ValueError('must supply a command word')
@@ -256,6 +252,12 @@ if __name__ == '__main__':
   elif cmd == 'clean':
     if not '-y' in opts:
       print 'NOT DELETING ANYTHING -- add -y switch to delete for real.'
+
+    try:
+      nkeep = int(remainder[0])
+    except:
+      usage('must specify number of dumps to keep, such as "clean 2"')
+
     dumps = RetrieveDumpTree(bucket)
     for h in dumps.keys():
       if host == h or '-a' in opts:
@@ -263,7 +265,7 @@ if __name__ == '__main__':
           for level in dumps[h][fs]:
             dates = dumps[h][fs][level].keys()
             dates.sort()
-            for d in dates[:0 - opts['-c']]:
+            for d in dates[:0 - int(remainder[0])]:
               if not '-q' in opts:
                 print 'deleting dump of %s:%s, level %s, %s' % \
                       (h, fs, level, d)
