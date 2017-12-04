@@ -76,6 +76,9 @@ class AWSHttpError(Error):
       self.message += ('-' * 20 + '\n' + http_response.read() + '\n' +
                        '-' * 20 + '\n')
 
+  def __str__(self):
+    return self.message
+
 
 class S3Object(object):
   def __init__(self, data, metadata={}):
@@ -766,23 +769,37 @@ if __name__ == '__main__':
     print '  %.2f seconds / %ld bytes per second' % \
       (elapsed_time, int(byte_count / elapsed_time))
 
+  # These may fail with an IAM key that is restricted to a specific
+  # bucket, which is not a problem if you are only going to be
+  # reading and writing that bucket.
+
   print 'Listing EC2 regions'
   cfg.service = 'ec2'
   method = 'GET'
   path = '/?Action=DescribeRegions&Version=2013-10-15'
   headers = {'Host': 'ec2.amazonaws.com'}
-  _print_status(b._make_request(method, path, headers))
+  try:
+    _print_status(b._make_request(method, path, headers))
+  except AWSHttpError, e:
+    print e
 
   cfg.service = 's3'
   print 'Listing buckets'
-  _print_status(b._make_request('GET', '/', {'host': 's3.amazonaws.com'}))
+  try:
+    _print_status(b._make_request('GET', '/', {'host': 's3.amazonaws.com'}))
+  except AWSHttpError, e:
+    print e
 
   test_bucket_name = cfg.access_key_id.lower() + '-s3.py-test-bucket'
-  print 'Creating test bucket %s' % test_bucket_name
-  _print_status(b.create_bucket(test_bucket_name))
+  try:
+    print 'Creating test bucket %s' % test_bucket_name
+    _print_status(b.create_bucket(test_bucket_name))
+    print 'Deleting test bucket %s' % test_bucket_name
+    _print_status(b.delete_bucket(test_bucket_name))
+  except AWSHttpError, e:
+    print e
 
-  print 'Deleting test bucket %s' % test_bucket_name
-  _print_status(b.delete_bucket(test_bucket_name))
+  # You probably need the rest of these tests to succeed.
 
   print 'Listing contents of %s' % cfg.bucket_name
   lst = b.list_bucket()
