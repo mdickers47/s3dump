@@ -37,6 +37,7 @@ import base64
 import hashlib
 import hmac
 import httplib
+import os
 import sys
 import time
 import urllib
@@ -89,7 +90,7 @@ class S3Object(object):
 
 
 class AWSConfig(object):
-  def __init__(self, config_file='/etc/s3_keys'):
+  def __init__(self, config_file=os.path.expanduser('~/.s3keys')):
     self.access_key_id = None
     self.secret_access_key = None
     self.bucket_name = None

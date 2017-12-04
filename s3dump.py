@@ -35,7 +35,7 @@ options that apply to any command:
 
 -q: suppress status messages, only report errors
 -L <arg>: ratelimit S3 socket to <arg>{k,m,g} bytes per second
--f <arg>: read S3 configuration from <arg> rather than /etc/s3_keys
+-f <arg>: read S3 configuration from <arg> rather than ~/.s3keys
 -i: use S3 'infrequent access' storage class
 """
 
