@@ -196,7 +196,7 @@ if __name__ == '__main__':
       elif len(remainder) == 2:
         filesystem, level = remainder
         if ':' in filesystem + level:
-          raise ValueError(': cannot appear in filesystem or level')
+          raise ValueError('colon (:) cannot appear in filesystem or level')
         key_prefix = ':'.join([host, filesystem, level, date])
       else:
         raise ValueError('must supply either -k or filesystem/level args')
@@ -288,7 +288,11 @@ if __name__ == '__main__':
     else:
       # find the last dump
       key_prefix = '%s:%s:%s:' % (host, filesystem, level)
-      key = bucket.list_bucket(key_prefix)[-1].key
+      objs = bucket.list_bucket(key_prefix)
+      if not objs:
+        sys.stderr.write('no objects found at prefix %s\n' % key_prefix)
+        sys.exit(1)
+      key = objs[-1].key
 
     # in this case we have the bucket send status messages to stderr,
     # because stdout is where the data goes.
