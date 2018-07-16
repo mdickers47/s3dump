@@ -127,7 +127,6 @@ def PrintTable(array, stream):
   fmt_specs = ['%' + {True: '', False: '-'}[numeric[i]]
                + str(col_widths[i]) + 's' for i in range(len(array[0]))]
   fmt_str = ' '.join(fmt_specs) + '\n'
-  print fmt_str
   hrule = '-' * ( sum(col_widths) + len(col_widths) - 1) + '\n'
   stream.write(fmt_str % array[0])
   stream.write(hrule)
