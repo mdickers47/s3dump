@@ -114,12 +114,20 @@ def PrintDumpTable(bucket):
 
 def PrintTable(array, stream):
   """given a 2d array (list of tuples), figure out column widths and
-  printf an ascii-art table."""
+  printf a corny hacky ascii table.  A column is right-justified iff all
+  of its values start with a digit."""
   col_widths = [0] * len(array[0])
-  for row in array:
+  numeric = [True] * len(array[0])
+  for rownum, row in enumerate(array):
     for i, val in enumerate(row):
-      if len(str(val)) > col_widths[i]: col_widths[i] = len(str(val))
-  fmt_str = ' '.join(['%-' + str(x) + 's' for x in col_widths]) + '\n'
+      if len(str(val)) > col_widths[i]:
+        col_widths[i] = len(str(val))
+      if rownum > 0 and not str(val)[0] in '0123456789':
+        numeric[i] = False
+  fmt_specs = ['%' + {True: '', False: '-'}[numeric[i]]
+               + str(col_widths[i]) + 's' for i in range(len(array[0]))]
+  fmt_str = ' '.join(fmt_specs) + '\n'
+  print fmt_str
   hrule = '-' * ( sum(col_widths) + len(col_widths) - 1) + '\n'
   stream.write(fmt_str % array[0])
   stream.write(hrule)
