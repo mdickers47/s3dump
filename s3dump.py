@@ -273,11 +273,14 @@ if __name__ == '__main__':
             dates = dumps[h][fs][level].keys()
             dates.sort()
             for d in dates[:0 - int(remainder[0])]:
+              key = ':'.join([h, fs, level, d])
               if not '-q' in opts:
-                print 'deleting dump of %s:%s, level %s, %s' % \
-                      (h, fs, level, d)
+                print 'deleting %s' % key
               if '-y' in opts:
-                s3.DeleteChunkedFile(bucket, ':'.join([h, fs, level, d]))
+                if s3.IsChunkedFile(bucket, key):
+                  s3.DeleteChunkedFile(bucket, ':'.join([h, fs, level, d]))
+                else:
+                  bucket.delete(key)
       
   elif cmd == 'list':
     print '-- Listing contents of %s' % config.bucket_name

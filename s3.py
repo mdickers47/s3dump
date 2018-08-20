@@ -704,6 +704,12 @@ def RetrieveChunkedFile(stream, bucket, key_prefix, stdout=None, stderr=None):
   return md5.hexdigest()
 
 
+def IsChunkedFile(bucket, key, stdout=None, stderr=None):
+  if not key.endswith('/'): key += '/'
+  key += 'chunk_'
+  return len(bucket.list_bucket(key)) > 0
+
+
 def DeleteChunkedFile(bucket, key_prefix, stdout=None, stderr=None):
   if not key_prefix.endswith('/'): key_prefix += '/'
   chunks = sorted([x.key for x in bucket.list_bucket(key_prefix)])
