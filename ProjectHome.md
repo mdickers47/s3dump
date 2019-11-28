@@ -1,1 +1,0 @@
-Python script that reads any arbitrary stream, divides it into chunks, labels them and stores them in your s3 account.  Also does the inverse.  Convenience features built around the assumption that it's being used with dump/restore for cheap backups.
