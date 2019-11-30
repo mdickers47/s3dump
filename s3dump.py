@@ -253,7 +253,10 @@ if __name__ == '__main__':
 
   elif cmd == 'dump':
     try:
-      bucket.put_streaming(key_prefix, sys.stdin,
+      # per python3 documentation, you now have to read from
+      # sys.stdin.buffer if you don't want it to be implicitly a "text
+      # type" stream.  This is all so much more intuitive now.
+      bucket.put_streaming(key_prefix, sys.stdin.buffer,
                            stdout=bucket_stdout, stderr=sys.stderr)
     except s3.Error as e:
       sys.stderr.write(e.message + '\n')
@@ -312,7 +315,7 @@ if __name__ == '__main__':
     if not '-q' in opts: bucket_stdout = sys.stderr
 
     try:
-      bucket.get_streaming(key, sys.stdout,
+      bucket.get_streaming(key, sys.stdout.buffer,
                            stdout=bucket_stdout, stderr=sys.stderr)
     except s3.Error as e:
       sys.stderr.write(e.message + '\n')

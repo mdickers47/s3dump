@@ -307,11 +307,15 @@ class Bucket:
       for k, v in list(s3obj.metadata.items()):
         headers[METADATA_PREFIX + k] = v
     else:
-      payload = ''
+      payload = b''
+
+    if not isinstance(payload, bytes):
+      print('WARNING: I had to bytes this for you: %s' % payload[:30])
+      payload = payload.encode('utf-8')
 
     headers['content-length'] = str(len(payload))
-    d = hashlib.md5(payload.encode('utf-8')).digest()
-    headers['content-md5'] = base64.encodestring(d).decode('utf-8').strip()
+    d = hashlib.md5(payload).digest()
+    headers['content-md5'] = base64.encodestring(d).decode('ascii').strip()
 
     if not 'x-amz-date' in headers:
       headers['x-amz-date'] = time.strftime(X_AMZ_DATE_FMT, time.gmtime())
@@ -321,7 +325,7 @@ class Bucket:
 
     if not 'x-amz-content-sha256' in headers:
       headers['x-amz-content-sha256'] = \
-        hashlib.sha256(payload.encode('utf-8')).hexdigest()
+        hashlib.sha256(payload).hexdigest()
 
     # sign the request with 'Authorization' header
     headers['authorization'] = auth_header_v4(method, path, headers,
@@ -566,7 +570,7 @@ class Bucket:
       body.append('<Part><PartNumber>%d</PartNumber><ETag>%s</ETag></Part>' \
                   % (i + 1, p))
     body.append('</CompleteMultipartUpload>')
-    body = '\n'.join(body)
+    body = '\n'.join(body).encode('ascii')
     path = '/%s?uploadId=%s' % (urllib.parse.quote(self.multipart_upload_key),
                                 urllib.parse.quote(self.multipart_upload_id))
     r = self._make_request('POST', path, s3obj=S3Object(body),
@@ -627,10 +631,10 @@ def ReadWithRatelimit(httpresponse, bytes_per_sec):
   are adjusted to try to target bytes_per_second per second.
   """
   if not bytes_per_sec: return httpresponse.read()
-  segment_size = bytes_per_sec / 4
+  segment_size = bytes_per_sec // 4
   if segment_size < 1: raise Error('impossibly low rate limit')
-  segment = ' ' * segment_size
-  data = ''
+  segment = b' ' * segment_size
+  data = b''
   last_read = time.time()
   while len(segment) == segment_size:
     segment = httpresponse.read(segment_size)
@@ -642,8 +646,9 @@ def ReadWithRatelimit(httpresponse, bytes_per_sec):
 
 
 def WriteWithRatelimit(httpconn, data, bytes_per_sec):
+  assert isinstance(data, bytes)
   if not bytes_per_sec: return httpconn.send(data)
-  segment_size = bytes_per_sec / 4
+  segment_size = bytes_per_sec // 4
   if segment_size < 1: raise Error('impossibly low rate limit')
   last_read = time.time()
   while data:
