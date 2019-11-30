@@ -39,6 +39,8 @@ options that apply to any command:
 -i: use S3 'infrequent access' storage class
 """
 
+from __future__ import print_function
+
 import getopt
 import os
 import s3
@@ -97,16 +99,17 @@ def PrintDumpTable(bucket):
   # flatten the dicts of (host,fs,level,date) => size to a 2d array
   if dumpsizes:
     rows = [ tuple([h, f, l, d, HumanizeBytes(s)])
-             for (h, f, l, d), s in dumpsizes.items() ]
+             for (h, f, l, d), s in list(dumpsizes.items()) ]
     rows.sort()
     rows.insert(0, ('-- host', 'filesystem', 'level', 'date', 'size'))
-    if othersizes: print '-- Dump-style objects:'
+    if othersizes: print('-- Dump-style objects:')
     PrintTable(rows, sys.stdout)
   if othersizes:
-    rows = [ tuple([k, HumanizeBytes(v)]) for k, v in othersizes.items() ]
+    rows = [ tuple([k, HumanizeBytes(v)])
+             for k, v in list(othersizes.items()) ]
     rows.sort()
     rows.insert(0, ('-- key', 'size'))
-    if dumpsizes: print '-- Other objects:'
+    if dumpsizes: print('-- Other objects:')
     PrintTable(rows, sys.stdout)
 
   return total_bytes
@@ -146,9 +149,9 @@ def DehumanizeBytes(s):
   units = ((40, 'T'), (30, 'G'), (20, 'M'), (10, 'K')) # NB K not k
   for bits, u in units:
     if s.upper().endswith(u):
-      return long(s[:-1]) * (2 ** bits)
+      return int(s[:-1]) * (2 ** bits)
   else:
-    return long(s)
+    return int(s)
 
 
 def ChangeRatelimit(signum, _):
@@ -208,13 +211,13 @@ if __name__ == '__main__':
       else:
         raise ValueError('must supply either -k or filesystem/level args')
 
-  except (getopt.GetoptError, ValueError, IndexError), e:
+  except (getopt.GetoptError, ValueError, IndexError) as e:
     usage(str(e))
 
   # load config
   try:
     config = s3.AWSConfig(config_file)
-  except s3.AWSConfigError, e:
+  except s3.AWSConfigError as e:
     sys.stderr.write('Error in config file %s: %s' % (config_file, e))
     sys.exit(1)
 
@@ -230,12 +233,12 @@ if __name__ == '__main__':
 
   if cmd == 'init' or cmd == 'initialize':
     # initialize dumps bucket
-    print 'Creating bucket %s' % config.bucket_name
-    print bucket.create_bucket().reason
-    print 'Testing ability to write, read, and delete:'
-    print bucket.put('testkey', s3.S3Object('this is a test')).reason
-    print bucket.get('testkey').reason
-    print bucket.delete('testkey').reason
+    print('Creating bucket %s' % config.bucket_name)
+    print(bucket.create_bucket().reason)
+    print('Testing ability to write, read, and delete:')
+    print(bucket.put('testkey', s3.S3Object('this is a test')).reason)
+    print(bucket.get('testkey').reason)
+    print(bucket.delete('testkey').reason)
 
   elif cmd == 'delete':
     try:
@@ -244,7 +247,7 @@ if __name__ == '__main__':
                              stdout=bucket_stdout, stderr=sys.stderr)
       else:
         bucket.delete(key_prefix)
-    except s3.Error, e:
+    except s3.Error as e:
       sys.stderr.write(e.message + '\n')
       sys.exit(1)
 
@@ -252,13 +255,13 @@ if __name__ == '__main__':
     try:
       bucket.put_streaming(key_prefix, sys.stdin,
                            stdout=bucket_stdout, stderr=sys.stderr)
-    except s3.Error, e:
+    except s3.Error as e:
       sys.stderr.write(e.message + '\n')
       sys.exit(1)
     
   elif cmd == 'clean':
     if not '-y' in opts:
-      print 'NOT DELETING ANYTHING -- add -y switch to delete for real.'
+      print('NOT DELETING ANYTHING -- add -y switch to delete for real.')
 
     try:
       nkeep = int(remainder[0])
@@ -266,16 +269,16 @@ if __name__ == '__main__':
       usage('must specify number of dumps to keep, such as "clean 2"')
 
     dumps = RetrieveDumpTree(bucket)
-    for h in dumps.keys():
+    for h in list(dumps.keys()):
       if host == h or '-a' in opts:
         for fs in dumps[h]:
           for level in dumps[h][fs]:
-            dates = dumps[h][fs][level].keys()
+            dates = list(dumps[h][fs][level].keys())
             dates.sort()
             for d in dates[:0 - int(remainder[0])]:
               key = ':'.join([h, fs, level, d])
               if not '-q' in opts:
-                print 'deleting %s' % key
+                print('deleting %s' % key)
               if '-y' in opts:
                 if s3.IsChunkedFile(bucket, key):
                   s3.DeleteChunkedFile(bucket, ':'.join([h, fs, level, d]))
@@ -283,14 +286,14 @@ if __name__ == '__main__':
                   bucket.delete(key)
       
   elif cmd == 'list':
-    print '-- Listing contents of %s' % config.bucket_name
+    print('-- Listing contents of %s' % config.bucket_name)
     try:
       total = PrintDumpTable(bucket)
-    except s3.AWSHttpError, e:
+    except s3.AWSHttpError as e:
       sys.stderr.write(e.message + '\n')
       sys.exit(1)
-    print '-- Total data stored: %s ($%.2f/month)' % \
-      (HumanizeBytes(total), total / (2**30) * 0.023)
+    print('-- Total data stored: %s ($%.2f/month)' % \
+      (HumanizeBytes(total), total / (2**30) * 0.023))
 
   elif cmd == 'restore' or cmd == 'retrieve':
     if '-w' in opts or '-k' in opts:
@@ -311,17 +314,17 @@ if __name__ == '__main__':
     try:
       bucket.get_streaming(key, sys.stdout,
                            stdout=bucket_stdout, stderr=sys.stderr)
-    except s3.Error, e:
+    except s3.Error as e:
       sys.stderr.write(e.message + '\n')
       sys.exit(1)
 
   elif cmd == 'getacl':
-    print bucket.get_acl(key_prefix).data
+    print(bucket.get_acl(key_prefix).data)
 
   elif cmd == 'putacl':
     #acl = sys.stdin.read()
     r = bucket.put_acl(key_prefix, s3.S3Object(sys.stdin.read()))
-    print '%s (%s)' % (r.status, r.reason)
+    print('%s (%s)' % (r.status, r.reason))
 
   else:
     usage('unrecognized command word: %s' % cmd)
