@@ -315,7 +315,7 @@ class Bucket:
 
     headers['content-length'] = str(len(payload))
     d = hashlib.md5(payload).digest()
-    headers['content-md5'] = base64.encodestring(d).decode('ascii').strip()
+    headers['content-md5'] = base64.encodebytes(d).decode('ascii').strip()
 
     if not 'x-amz-date' in headers:
       headers['x-amz-date'] = time.strftime(X_AMZ_DATE_FMT, time.gmtime())
